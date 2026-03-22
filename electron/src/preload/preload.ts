@@ -5,5 +5,6 @@ contextBridge.exposeInMainWorld("voxdub", {
   setState: (state: "idle" | "monitoring" | "detected" | "dubbing") =>
     ipcRenderer.invoke("set-state", state),
   testNotification: () => ipcRenderer.invoke("test-notification"),
-  toggleOverlay: () => ipcRenderer.invoke("toggle-overlay")
+  toggleOverlay: () => ipcRenderer.invoke("toggle-overlay"),
+  saveTranscript: () => ipcRenderer.invoke("save-transcript")
 });
