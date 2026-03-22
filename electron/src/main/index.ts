@@ -1,6 +1,14 @@
 import { app, BrowserWindow, Tray, Menu, nativeImage, Notification, ipcMain } from "electron";
 import path from "path";
-import { AppState, getState, setState, getStateLabel, getStateColor } from "./state-machine";
+import {
+  AppState,
+  getState,
+  setState,
+  getStateLabel,
+  getStateColor,
+  canTransitionTo,
+  forceState
+} from "./state-machine";
 import { transcriptLines, saveTranscript } from "./transcript-store";
 import {
   startPythonWorker,
@@ -27,9 +35,28 @@ function getTranscriptHtml(state: AppState): string {
     .join("");
 }
 
+function isDisabled(targetState: AppState): boolean {
+  const current = getState();
+  return !canTransitionTo(targetState) && current !== targetState;
+}
+
+function getButtonStyle(disabled: boolean): string {
+  return `
+    padding:10px 16px;
+    font-size:14px;
+    cursor:${disabled ? "not-allowed" : "pointer"};
+    opacity:${disabled ? "0.5" : "1"};
+  `;
+}
+
 function getMainWindowHtml(state: AppState): string {
   const stateLabel = getStateLabel(state);
   const stateColor = getStateColor(state);
+
+  const idleDisabled = isDisabled("idle");
+  const monitoringDisabled = isDisabled("monitoring");
+  const detectedDisabled = isDisabled("detected");
+  const dubbingDisabled = isDisabled("dubbing");
 
   return `
     <!DOCTYPE html>
@@ -42,13 +69,13 @@ function getMainWindowHtml(state: AppState): string {
         <div style="padding:24px;">
           <h1>VoxDub Control Center</h1>
           <p>Status: <strong style="color:${stateColor};">${stateLabel}</strong></p>
-          <p>This is the Phase 5 VoxDub shell with transcript export and a command-driven Python worker.</p>
+          <p>This is the Phase 6 VoxDub shell with guarded state transitions.</p>
 
           <div style="margin-top:24px;display:flex;gap:12px;flex-wrap:wrap;">
-            <button onclick="window.voxdub.setState('idle')" style="padding:10px 16px;font-size:14px;cursor:pointer;">Set Idle</button>
-            <button onclick="window.voxdub.setState('monitoring')" style="padding:10px 16px;font-size:14px;cursor:pointer;">Start Monitoring</button>
-            <button onclick="window.voxdub.setState('detected')" style="padding:10px 16px;font-size:14px;cursor:pointer;">Simulate Detection</button>
-            <button onclick="window.voxdub.setState('dubbing')" style="padding:10px 16px;font-size:14px;cursor:pointer;">Start Dubbing</button>
+            <button ${idleDisabled ? "disabled" : ""} onclick="window.voxdub.setState('idle')" style="${getButtonStyle(idleDisabled)}">Set Idle</button>
+            <button ${monitoringDisabled ? "disabled" : ""} onclick="window.voxdub.setState('monitoring')" style="${getButtonStyle(monitoringDisabled)}">Start Monitoring</button>
+            <button ${detectedDisabled ? "disabled" : ""} onclick="window.voxdub.setState('detected')" style="${getButtonStyle(detectedDisabled)}">Simulate Detection</button>
+            <button ${dubbingDisabled ? "disabled" : ""} onclick="window.voxdub.setState('dubbing')" style="${getButtonStyle(dubbingDisabled)}">Start Dubbing</button>
             <button onclick="window.voxdub.testNotification()" style="padding:10px 16px;font-size:14px;cursor:pointer;">Test Notification</button>
             <button onclick="window.voxdub.toggleOverlay()" style="padding:10px 16px;font-size:14px;cursor:pointer;">Toggle Overlay</button>
             <button onclick="window.voxdub.saveTranscript()" style="padding:10px 16px;font-size:14px;cursor:pointer;">Save Transcript</button>
@@ -65,6 +92,7 @@ function getMainWindowHtml(state: AppState): string {
               <li>Transcript export works</li>
               <li>Python worker integration works</li>
               <li>Python command loop works</li>
+              <li>Transition guards work</li>
             </ul>
           </div>
 
@@ -119,11 +147,49 @@ function updateWindowsForState(): void {
 }
 
 function changeState(newState: AppState): void {
-  setState(newState);
+  const oldState = getState();
+
+  if (oldState === newState) {
+    console.log(`Ignoring duplicate state change: ${oldState} -> ${newState}`);
+    return;
+  }
+
+  const changed = setState(newState);
+
+  if (!changed) {
+    console.warn(`Blocked invalid transition: ${oldState} -> ${newState}`);
+    return;
+  }
+
+  console.log(`State changed: ${oldState} -> ${newState}`);
   updateWindowsForState();
 
   if (newState === "detected") {
     showDetectionNotification();
+  }
+}
+
+function sendStateCommand(targetState: AppState): void {
+  const current = getState();
+
+  if (current === targetState) {
+    console.log(`Ignoring duplicate command for current state: ${targetState}`);
+    return;
+  }
+
+  if (!canTransitionTo(targetState)) {
+    console.warn(`Blocked invalid command transition: ${current} -> ${targetState}`);
+    return;
+  }
+
+  if (targetState === "monitoring") {
+    sendCommand({ action: "start_monitoring" });
+  } else if (targetState === "detected") {
+    sendCommand({ action: "detect_language" });
+  } else if (targetState === "dubbing") {
+    sendCommand({ action: "start_dubbing" });
+  } else if (targetState === "idle") {
+    sendCommand({ action: "stop" });
   }
 }
 
@@ -223,19 +289,19 @@ function createTray(): void {
     },
     {
       label: "Set Idle",
-      click: () => sendCommand({ action: "stop" })
+      click: () => sendStateCommand("idle")
     },
     {
       label: "Start Monitoring",
-      click: () => sendCommand({ action: "start_monitoring" })
+      click: () => sendStateCommand("monitoring")
     },
     {
       label: "Simulate Detection",
-      click: () => sendCommand({ action: "detect_language" })
+      click: () => sendStateCommand("detected")
     },
     {
       label: "Start Dubbing",
-      click: () => sendCommand({ action: "start_dubbing" })
+      click: () => sendStateCommand("dubbing")
     },
     {
       label: "Toggle Overlay",
@@ -280,6 +346,8 @@ function createTray(): void {
 }
 
 app.whenReady().then(() => {
+  forceState("idle");
+
   createMainWindow();
   createOverlayWindow();
   createTray();
@@ -287,15 +355,7 @@ app.whenReady().then(() => {
   startPythonWorker(handleWorkerEvent);
 
   ipcMain.handle("set-state", async (_event, state: AppState) => {
-    if (state === "monitoring") {
-      sendCommand({ action: "start_monitoring" });
-    } else if (state === "detected") {
-      sendCommand({ action: "detect_language" });
-    } else if (state === "dubbing") {
-      sendCommand({ action: "start_dubbing" });
-    } else if (state === "idle") {
-      sendCommand({ action: "stop" });
-    }
+    sendStateCommand(state);
   });
 
   ipcMain.handle("test-notification", async () => {

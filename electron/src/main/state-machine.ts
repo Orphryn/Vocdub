@@ -2,11 +2,35 @@ export type AppState = "idle" | "monitoring" | "detected" | "dubbing";
 
 let currentState: AppState = "idle";
 
+const allowedTransitions: Record<AppState, AppState[]> = {
+  idle: ["monitoring"],
+  monitoring: ["detected", "idle"],
+  detected: ["dubbing", "idle"],
+  dubbing: ["idle"]
+};
+
 export function getState(): AppState {
   return currentState;
 }
 
-export function setState(state: AppState): void {
+export function canTransitionTo(nextState: AppState): boolean {
+  if (nextState === currentState) {
+    return false;
+  }
+
+  return allowedTransitions[currentState].includes(nextState);
+}
+
+export function setState(state: AppState): boolean {
+  if (!canTransitionTo(state)) {
+    return false;
+  }
+
+  currentState = state;
+  return true;
+}
+
+export function forceState(state: AppState): void {
   currentState = state;
 }
 
