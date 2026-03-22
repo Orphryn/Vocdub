@@ -35,11 +35,7 @@ export function saveTranscript(state: AppState): string {
   }
 
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
-
-  const filePath = path.join(
-    folder,
-    `transcript-${state}-${timestamp}.txt`
-  );
+  const filePath = path.join(folder, `transcript-${state}-${timestamp}.txt`);
 
   const content = [
     "VoxDub Transcript Export",
