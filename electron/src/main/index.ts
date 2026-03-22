@@ -2,6 +2,7 @@ import { app, BrowserWindow, Tray, Menu, nativeImage, Notification, ipcMain } fr
 import path from "path";
 import { AppState, getState, setState, getStateLabel, getStateColor } from "./state-machine";
 import { transcriptLines, saveTranscript } from "./transcript-store";
+import { startPythonWorker, stopPythonWorker, WorkerEvent } from "./python-worker";
 
 let tray: Tray | null = null;
 let mainWindow: BrowserWindow | null = null;
@@ -36,7 +37,7 @@ function getMainWindowHtml(state: AppState): string {
         <div style="padding:24px;">
           <h1>VoxDub Control Center</h1>
           <p>Status: <strong style="color:${stateColor};">${stateLabel}</strong></p>
-          <p>This is the Phase 3 VoxDub shell with simulated app states and transcript export.</p>
+          <p>This is the Phase 4 VoxDub shell with simulated app states, transcript export, and a Python worker.</p>
 
           <div style="margin-top:24px;display:flex;gap:12px;flex-wrap:wrap;">
             <button onclick="window.voxdub.setState('idle')" style="padding:10px 16px;font-size:14px;cursor:pointer;">Set Idle</button>
@@ -57,6 +58,7 @@ function getMainWindowHtml(state: AppState): string {
               <li>Notification test works</li>
               <li>App state simulation works</li>
               <li>Transcript export works</li>
+              <li>Python worker integration works</li>
             </ul>
           </div>
 
@@ -116,6 +118,14 @@ function changeState(newState: AppState): void {
 
   if (newState === "detected") {
     showDetectionNotification();
+  }
+}
+
+function handleWorkerEvent(event: WorkerEvent): void {
+  console.log("Worker event received:", event);
+
+  if (event.type === "state_change") {
+    changeState(event.state);
   }
 }
 
@@ -263,6 +273,8 @@ app.whenReady().then(() => {
   createOverlayWindow();
   createTray();
 
+  startPythonWorker(handleWorkerEvent);
+
   ipcMain.handle("set-state", async (_event, state: AppState) => {
     changeState(state);
   });
@@ -282,6 +294,7 @@ app.whenReady().then(() => {
 
 app.on("before-quit", () => {
   isQuitting = true;
+  stopPythonWorker();
 });
 
 app.on("window-all-closed", () => {
