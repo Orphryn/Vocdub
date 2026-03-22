@@ -69,12 +69,12 @@ function getMainWindowHtml(state: AppState): string {
         <div style="padding:24px;">
           <h1>VoxDub Control Center</h1>
           <p>Status: <strong style="color:${stateColor};">${stateLabel}</strong></p>
-          <p>This is the Phase 6 VoxDub shell with guarded state transitions.</p>
+          <p>This is the Phase 6 VoxDub shell with a stateful Python monitoring worker.</p>
 
           <div style="margin-top:24px;display:flex;gap:12px;flex-wrap:wrap;">
-            <button ${idleDisabled ? "disabled" : ""} onclick="window.voxdub.setState('idle')" style="${getButtonStyle(idleDisabled)}">Set Idle</button>
+            <button ${idleDisabled ? "disabled" : ""} onclick="window.voxdub.setState('idle')" style="${getButtonStyle(idleDisabled)}">Stop / Set Idle</button>
             <button ${monitoringDisabled ? "disabled" : ""} onclick="window.voxdub.setState('monitoring')" style="${getButtonStyle(monitoringDisabled)}">Start Monitoring</button>
-            <button ${detectedDisabled ? "disabled" : ""} onclick="window.voxdub.setState('detected')" style="${getButtonStyle(detectedDisabled)}">Simulate Detection</button>
+            <button ${detectedDisabled ? "disabled" : ""} onclick="window.voxdub.setState('detected')" style="${getButtonStyle(detectedDisabled)}">Manual Detect</button>
             <button ${dubbingDisabled ? "disabled" : ""} onclick="window.voxdub.setState('dubbing')" style="${getButtonStyle(dubbingDisabled)}">Start Dubbing</button>
             <button onclick="window.voxdub.testNotification()" style="padding:10px 16px;font-size:14px;cursor:pointer;">Test Notification</button>
             <button onclick="window.voxdub.toggleOverlay()" style="padding:10px 16px;font-size:14px;cursor:pointer;">Toggle Overlay</button>
@@ -93,6 +93,7 @@ function getMainWindowHtml(state: AppState): string {
               <li>Python worker integration works</li>
               <li>Python command loop works</li>
               <li>Transition guards work</li>
+              <li>Automatic monitoring-to-detection flow works</li>
             </ul>
           </div>
 
@@ -185,7 +186,7 @@ function sendStateCommand(targetState: AppState): void {
   if (targetState === "monitoring") {
     sendCommand({ action: "start_monitoring" });
   } else if (targetState === "detected") {
-    sendCommand({ action: "detect_language" });
+    sendCommand({ action: "simulate_detection" });
   } else if (targetState === "dubbing") {
     sendCommand({ action: "start_dubbing" });
   } else if (targetState === "idle") {
@@ -288,7 +289,7 @@ function createTray(): void {
       }
     },
     {
-      label: "Set Idle",
+      label: "Stop / Set Idle",
       click: () => sendStateCommand("idle")
     },
     {
@@ -296,7 +297,7 @@ function createTray(): void {
       click: () => sendStateCommand("monitoring")
     },
     {
-      label: "Simulate Detection",
+      label: "Manual Detect",
       click: () => sendStateCommand("detected")
     },
     {
