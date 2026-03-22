@@ -17,15 +17,33 @@ function createMainWindow(): void {
     }
   });
 
-  mainWindow.loadURL(
-    "data:text/html,<h1 style='font-family:sans-serif;padding:20px;'>VoxDub Main Window</h1>"
-  );
+  mainWindow.loadURL(`
+    data:text/html,
+    <body style="margin:0;font-family:Arial,sans-serif;background:#f4f4f4;color:#111;">
+      <div style="padding:24px;">
+        <h1>VoxDub Control Center</h1>
+        <p>Status: <strong>Idle</strong></p>
+        <p>This is the Phase 1 Electron shell.</p>
+        <ul>
+          <li>Main window works</li>
+          <li>Tray menu works</li>
+          <li>Overlay window works</li>
+          <li>Notification test works</li>
+        </ul>
+      </div>
+    </body>
+  `);
+
+  mainWindow.on("close", (event) => {
+    event.preventDefault();
+    mainWindow?.hide();
+  });
 }
 
 function createOverlayWindow(): void {
   overlayWindow = new BrowserWindow({
-    width: 320,
-    height: 90,
+    width: 340,
+    height: 100,
     show: false,
     frame: false,
     transparent: false,
@@ -42,9 +60,10 @@ function createOverlayWindow(): void {
 
   overlayWindow.loadURL(`
     data:text/html,
-    <body style="margin:0;background:#111;color:#fff;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;">
-      <div style="padding:16px;border-radius:12px;background:#1e1e1e;">
-        VoxDub Overlay
+    <body style="margin:0;background:#111;color:#fff;font-family:Arial,sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;">
+      <div style="padding:16px 20px;border-radius:12px;background:#1e1e1e;box-shadow:0 4px 12px rgba(0,0,0,0.35);">
+        <strong>VoxDub Overlay</strong><br />
+        <span style="font-size:13px;color:#bbb;">Ready for live dubbing controls</span>
       </div>
     </body>
   `);
@@ -57,6 +76,17 @@ function showDetectionNotification(): void {
   });
 
   notification.show();
+}
+
+function toggleOverlay(): void {
+  if (!overlayWindow) return;
+
+  if (overlayWindow.isVisible()) {
+    overlayWindow.hide();
+  } else {
+    overlayWindow.show();
+    overlayWindow.focus();
+  }
 }
 
 function createTray(): void {
@@ -78,12 +108,9 @@ function createTray(): void {
       }
     },
     {
-      label: "Show Overlay",
+      label: "Toggle Overlay",
       click: () => {
-        if (overlayWindow) {
-          overlayWindow.show();
-          overlayWindow.focus();
-        }
+        toggleOverlay();
       }
     },
     {
@@ -98,7 +125,7 @@ function createTray(): void {
     {
       label: "Quit VoxDub",
       click: () => {
-        app.quit();
+        app.exit();
       }
     }
   ]);
@@ -107,14 +134,7 @@ function createTray(): void {
   createdTray.setContextMenu(contextMenu);
 
   createdTray.on("click", () => {
-    if (overlayWindow) {
-      if (overlayWindow.isVisible()) {
-        overlayWindow.hide();
-      } else {
-        overlayWindow.show();
-        overlayWindow.focus();
-      }
-    }
+    toggleOverlay();
   });
 }
 
