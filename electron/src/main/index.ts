@@ -21,18 +21,32 @@ let tray: Tray | null = null;
 let mainWindow: BrowserWindow | null = null;
 let overlayWindow: BrowserWindow | null = null;
 let isQuitting = false;
+let liveSessionLines: string[] = [];
 
 function htmlToDataUrl(html: string): string {
   return `data:text/html;charset=UTF-8,${encodeURIComponent(html)}`;
 }
 
+function addLiveSessionLine(line: string): void {
+  liveSessionLines.push(line);
+
+  if (liveSessionLines.length > 30) {
+    liveSessionLines = liveSessionLines.slice(-30);
+  }
+}
+
 function getTranscriptHtml(state: AppState): string {
-  return transcriptLines[state]
-    .map(
-      (line) =>
-        `<div style="padding:8px 0;border-bottom:1px solid #eee;font-family:Consolas,monospace;font-size:14px;">${line}</div>`
-    )
-    .join("");
+  const baseLines = transcriptLines[state].map(
+    (line) =>
+      `<div style="padding:8px 0;border-bottom:1px solid #eee;font-family:Consolas,monospace;font-size:14px;">${line}</div>`
+  );
+
+  const liveLines = liveSessionLines.map(
+    (line) =>
+      `<div style="padding:8px 0;border-bottom:1px solid #f0f0f0;font-family:Consolas,monospace;font-size:14px;color:#222;">${line}</div>`
+  );
+
+  return [...baseLines, ...liveLines].join("");
 }
 
 function isDisabled(targetState: AppState): boolean {
@@ -69,39 +83,34 @@ function getMainWindowHtml(state: AppState): string {
         <div style="padding:24px;">
           <h1>VoxDub Control Center</h1>
           <p>Status: <strong style="color:${stateColor};">${stateLabel}</strong></p>
-          <p>This is the Phase 7 VoxDub shell with audio device discovery.</p>
+          <p>This build adds real microphone energy detection and local Whisper transcription.</p>
 
           <div style="margin-top:24px;display:flex;gap:12px;flex-wrap:wrap;">
             <button ${idleDisabled ? "disabled" : ""} onclick="window.voxdub.setState('idle')" style="${getButtonStyle(idleDisabled)}">Stop / Set Idle</button>
             <button ${monitoringDisabled ? "disabled" : ""} onclick="window.voxdub.setState('monitoring')" style="${getButtonStyle(monitoringDisabled)}">Start Monitoring</button>
             <button ${detectedDisabled ? "disabled" : ""} onclick="window.voxdub.setState('detected')" style="${getButtonStyle(detectedDisabled)}">Manual Detect</button>
             <button ${dubbingDisabled ? "disabled" : ""} onclick="window.voxdub.setState('dubbing')" style="${getButtonStyle(dubbingDisabled)}">Start Dubbing</button>
+            <button onclick="window.voxdub.listAudioDevices()" style="padding:10px 16px;font-size:14px;cursor:pointer;">List Audio Devices</button>
+            <button onclick="window.voxdub.setDefaultInputDevice()" style="padding:10px 16px;font-size:14px;cursor:pointer;">Use Default Input</button>
             <button onclick="window.voxdub.testNotification()" style="padding:10px 16px;font-size:14px;cursor:pointer;">Test Notification</button>
             <button onclick="window.voxdub.toggleOverlay()" style="padding:10px 16px;font-size:14px;cursor:pointer;">Toggle Overlay</button>
             <button onclick="window.voxdub.saveTranscript()" style="padding:10px 16px;font-size:14px;cursor:pointer;">Save Transcript</button>
-            <button onclick="window.voxdub.listAudioDevices()" style="padding:10px 16px;font-size:14px;cursor:pointer;">List Audio Devices</button>
           </div>
 
-          <div style="margin-top:28px;padding:16px;border-radius:12px;background:white;border:1px solid #ddd;max-width:760px;">
+          <div style="margin-top:28px;padding:16px;border-radius:12px;background:white;border:1px solid #ddd;max-width:780px;">
             <h3 style="margin-top:0;">Current Phase</h3>
             <ul>
-              <li>Main window works</li>
-              <li>Tray menu works</li>
-              <li>Overlay window works</li>
-              <li>Notification test works</li>
-              <li>App state simulation works</li>
-              <li>Transcript export works</li>
-              <li>Python worker integration works</li>
-              <li>Python command loop works</li>
-              <li>Transition guards work</li>
-              <li>Automatic monitoring-to-detection flow works</li>
+              <li>Real microphone energy detection works</li>
               <li>Audio device discovery works</li>
+              <li>Default input selection works</li>
+              <li>Whisper transcription runs after voice detection</li>
+              <li>Live session events appear below</li>
             </ul>
           </div>
 
-          <div style="margin-top:24px;padding:16px;border-radius:12px;background:white;border:1px solid #ddd;max-width:760px;">
+          <div style="margin-top:24px;padding:16px;border-radius:12px;background:white;border:1px solid #ddd;max-width:780px;">
             <h3 style="margin-top:0;">Transcript Preview</h3>
-            <div style="margin-top:12px;max-height:220px;overflow:auto;border:1px solid #eee;border-radius:8px;padding:0 12px;background:#fafafa;">
+            <div style="margin-top:12px;max-height:320px;overflow:auto;border:1px solid #eee;border-radius:8px;padding:0 12px;background:#fafafa;">
               ${getTranscriptHtml(state)}
             </div>
           </div>
@@ -165,6 +174,7 @@ function changeState(newState: AppState): void {
   }
 
   console.log(`State changed: ${oldState} -> ${newState}`);
+  addLiveSessionLine(`[State] ${oldState} -> ${newState}`);
   updateWindowsForState();
 
   if (newState === "detected") {
@@ -206,11 +216,45 @@ function handleWorkerEvent(event: WorkerEvent): void {
 
   if (event.type === "audio_devices") {
     console.log("Audio devices:", event.data);
+    addLiveSessionLine(`[AudioDevices] ${event.message}`);
+    updateWindowsForState();
+    return;
+  }
+
+  if (event.type === "device_selected") {
+    console.log("Device selected:", event.data);
+    addLiveSessionLine(`[Device] ${event.message}`);
+    updateWindowsForState();
+    new Notification({
+      title: "VoxDub",
+      body: event.message
+    }).show();
+    return;
+  }
+
+  if (event.type === "voice_activity") {
+    console.log("Voice activity:", event.message);
+    addLiveSessionLine(`[VoiceActivity] ${event.message}`);
+    updateWindowsForState();
+    return;
+  }
+
+  if (event.type === "transcription") {
+    const payload = event.data as { text?: string; language?: string; language_probability?: number } | undefined;
+    const text = payload?.text ?? event.message;
+    const language = payload?.language ?? "unknown";
+    const probability = payload?.language_probability ?? 0;
+
+    console.log("Transcription:", payload);
+    addLiveSessionLine(`[Transcription][${language} ${probability.toFixed(2)}] ${text}`);
+    updateWindowsForState();
     return;
   }
 
   if (event.type === "status") {
     console.log("Worker status:", event.message);
+    addLiveSessionLine(`[Status] ${event.message}`);
+    updateWindowsForState();
   }
 }
 
@@ -236,8 +280,8 @@ function toggleOverlay(): void {
 
 function createMainWindow(): void {
   mainWindow = new BrowserWindow({
-    width: 950,
-    height: 760,
+    width: 1000,
+    height: 820,
     show: true,
     webPreferences: {
       preload: path.join(__dirname, "../preload/preload.js"),
@@ -312,6 +356,18 @@ function createTray(): void {
       click: () => sendStateCommand("dubbing")
     },
     {
+      label: "List Audio Devices",
+      click: () => {
+        sendCommand({ action: "list_audio_devices" });
+      }
+    },
+    {
+      label: "Use Default Input",
+      click: () => {
+        sendCommand({ action: "set_default_input_device" });
+      }
+    },
+    {
       label: "Toggle Overlay",
       click: () => {
         toggleOverlay();
@@ -326,17 +382,11 @@ function createTray(): void {
     {
       label: "Save Transcript",
       click: () => {
-        const savedPath = saveTranscript(getState());
+        const savedPath = saveTranscript(getState(), liveSessionLines);
         new Notification({
           title: "VoxDub",
           body: `Transcript saved to ${savedPath}`
         }).show();
-      }
-    },
-    {
-      label: "List Audio Devices",
-      click: () => {
-        sendCommand({ action: "list_audio_devices" });
       }
     },
     {
@@ -361,6 +411,7 @@ function createTray(): void {
 
 app.whenReady().then(() => {
   forceState("idle");
+  liveSessionLines = [];
 
   createMainWindow();
   createOverlayWindow();
@@ -381,11 +432,15 @@ app.whenReady().then(() => {
   });
 
   ipcMain.handle("save-transcript", async () => {
-    return saveTranscript(getState());
+    return saveTranscript(getState(), liveSessionLines);
   });
 
   ipcMain.handle("list-audio-devices", async () => {
     sendCommand({ action: "list_audio_devices" });
+  });
+
+  ipcMain.handle("set-default-input-device", async () => {
+    sendCommand({ action: "set_default_input_device" });
   });
 });
 

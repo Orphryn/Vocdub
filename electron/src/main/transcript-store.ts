@@ -9,24 +9,24 @@ export const transcriptLines: Record<AppState, string[]> = {
     "[System] Waiting for media monitoring to begin."
   ],
   monitoring: [
-    "[System] Monitoring browser and local video audio...",
-    "[Detector] Speech activity check active.",
-    "[Detector] Language identification pending."
+    "[System] Monitoring selected audio input device...",
+    "[Detector] Voice activity threshold armed.",
+    "[Detector] Waiting for speech."
   ],
   detected: [
-    "[Detector] Foreign language detected: Spanish",
-    "[Detector] Confidence: 0.91",
+    "[Detector] Speech activity detected.",
+    "[Detector] Foreign language detection trigger fired.",
     "[Prompt] Ready to start dubbing."
   ],
   dubbing: [
-    "[STT] Hola, bienvenidos a nuestro programa.",
-    "[Translate] Hello, welcome to our program.",
-    "[TTS] Dubbed voice playback started.",
+    "[STT] Local transcription pipeline active.",
+    "[Translate] Translation pipeline not wired yet.",
+    "[TTS] Dubbed playback pipeline not wired yet.",
     "[System] Overlay active."
   ]
 };
 
-export function saveTranscript(state: AppState): string {
+export function saveTranscript(state: AppState, extraLines: string[] = []): string {
   const documentsPath = path.join(os.homedir(), "Documents");
   const folder = path.join(documentsPath, "VoxDub");
 
@@ -42,7 +42,10 @@ export function saveTranscript(state: AppState): string {
     `State: ${getStateLabel(state)}`,
     `Created: ${new Date().toString()}`,
     "",
-    ...transcriptLines[state]
+    ...transcriptLines[state],
+    "",
+    "[Live Session Events]",
+    ...extraLines
   ].join("\n");
 
   fs.writeFileSync(filePath, content, "utf-8");

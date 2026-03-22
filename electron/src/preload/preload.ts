@@ -7,5 +7,6 @@ contextBridge.exposeInMainWorld("voxdub", {
   testNotification: () => ipcRenderer.invoke("test-notification"),
   toggleOverlay: () => ipcRenderer.invoke("toggle-overlay"),
   saveTranscript: () => ipcRenderer.invoke("save-transcript"),
-  listAudioDevices: () => ipcRenderer.invoke("list-audio-devices")
+  listAudioDevices: () => ipcRenderer.invoke("list-audio-devices"),
+  setDefaultInputDevice: () => ipcRenderer.invoke("set-default-input-device")
 });
