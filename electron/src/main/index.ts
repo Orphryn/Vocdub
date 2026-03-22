@@ -2,7 +2,12 @@ import { app, BrowserWindow, Tray, Menu, nativeImage, Notification, ipcMain } fr
 import path from "path";
 import { AppState, getState, setState, getStateLabel, getStateColor } from "./state-machine";
 import { transcriptLines, saveTranscript } from "./transcript-store";
-import { startPythonWorker, stopPythonWorker, WorkerEvent } from "./python-worker";
+import {
+  startPythonWorker,
+  stopPythonWorker,
+  sendCommand,
+  WorkerEvent
+} from "./python-worker";
 
 let tray: Tray | null = null;
 let mainWindow: BrowserWindow | null = null;
@@ -37,7 +42,7 @@ function getMainWindowHtml(state: AppState): string {
         <div style="padding:24px;">
           <h1>VoxDub Control Center</h1>
           <p>Status: <strong style="color:${stateColor};">${stateLabel}</strong></p>
-          <p>This is the Phase 4 VoxDub shell with simulated app states, transcript export, and a Python worker.</p>
+          <p>This is the Phase 5 VoxDub shell with transcript export and a command-driven Python worker.</p>
 
           <div style="margin-top:24px;display:flex;gap:12px;flex-wrap:wrap;">
             <button onclick="window.voxdub.setState('idle')" style="padding:10px 16px;font-size:14px;cursor:pointer;">Set Idle</button>
@@ -59,6 +64,7 @@ function getMainWindowHtml(state: AppState): string {
               <li>App state simulation works</li>
               <li>Transcript export works</li>
               <li>Python worker integration works</li>
+              <li>Python command loop works</li>
             </ul>
           </div>
 
@@ -126,6 +132,11 @@ function handleWorkerEvent(event: WorkerEvent): void {
 
   if (event.type === "state_change") {
     changeState(event.state);
+    return;
+  }
+
+  if (event.type === "status") {
+    console.log("Worker status:", event.message);
   }
 }
 
@@ -212,19 +223,19 @@ function createTray(): void {
     },
     {
       label: "Set Idle",
-      click: () => changeState("idle")
+      click: () => sendCommand({ action: "stop" })
     },
     {
       label: "Start Monitoring",
-      click: () => changeState("monitoring")
+      click: () => sendCommand({ action: "start_monitoring" })
     },
     {
       label: "Simulate Detection",
-      click: () => changeState("detected")
+      click: () => sendCommand({ action: "detect_language" })
     },
     {
       label: "Start Dubbing",
-      click: () => changeState("dubbing")
+      click: () => sendCommand({ action: "start_dubbing" })
     },
     {
       label: "Toggle Overlay",
@@ -276,7 +287,15 @@ app.whenReady().then(() => {
   startPythonWorker(handleWorkerEvent);
 
   ipcMain.handle("set-state", async (_event, state: AppState) => {
-    changeState(state);
+    if (state === "monitoring") {
+      sendCommand({ action: "start_monitoring" });
+    } else if (state === "detected") {
+      sendCommand({ action: "detect_language" });
+    } else if (state === "dubbing") {
+      sendCommand({ action: "start_dubbing" });
+    } else if (state === "idle") {
+      sendCommand({ action: "stop" });
+    }
   });
 
   ipcMain.handle("test-notification", async () => {

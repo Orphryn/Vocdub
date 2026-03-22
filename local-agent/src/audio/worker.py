@@ -12,20 +12,40 @@ def send_event(event_type: str, state: str, message: str) -> None:
     print(json.dumps(payload), flush=True)
 
 
+def handle_command(command: dict) -> None:
+    action = command.get("action")
+
+    if action == "start_monitoring":
+        send_event("state_change", "monitoring", "Monitoring started")
+
+    elif action == "detect_language":
+        time.sleep(1)
+        send_event("state_change", "detected", "Foreign language detected")
+
+    elif action == "start_dubbing":
+        send_event("state_change", "dubbing", "Dubbing started")
+
+    elif action == "stop":
+        send_event("state_change", "idle", "Stopped")
+
+    else:
+        send_event("status", "idle", f"Unknown command: {action}")
+
+
 def main() -> None:
-    send_event("status", "idle", "Python worker started")
-    time.sleep(2)
+    send_event("status", "idle", "Worker ready")
 
-    send_event("state_change", "monitoring", "Monitoring started")
-    time.sleep(3)
+    while True:
+        line = sys.stdin.readline()
 
-    send_event("state_change", "detected", "Foreign language detected")
-    time.sleep(3)
+        if not line:
+            break
 
-    send_event("state_change", "dubbing", "Dubbing started")
-    time.sleep(3)
-
-    send_event("state_change", "idle", "Returning to idle")
+        try:
+            command = json.loads(line.strip())
+            handle_command(command)
+        except Exception as e:
+            send_event("status", "idle", f"Error: {str(e)}")
 
 
 if __name__ == "__main__":

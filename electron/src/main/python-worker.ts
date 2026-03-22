@@ -10,9 +10,7 @@ export type WorkerEvent = {
 let workerProcess: ChildProcessWithoutNullStreams | null = null;
 
 export function startPythonWorker(onEvent: (event: WorkerEvent) => void): void {
-  if (workerProcess) {
-    return;
-  }
+  if (workerProcess) return;
 
   const workerPath = path.join(
     process.cwd(),
@@ -23,37 +21,34 @@ export function startPythonWorker(onEvent: (event: WorkerEvent) => void): void {
     "worker.py"
   );
 
-  console.log("Starting Python worker at:", workerPath);
-
   workerProcess = spawn("python", [workerPath]);
 
   workerProcess.stdout.on("data", (data: Buffer) => {
-    const output = data.toString().trim();
-
-    if (!output) {
-      return;
-    }
-
-    const lines = output.split(/\r?\n/);
+    const lines = data.toString().trim().split(/\r?\n/);
 
     for (const line of lines) {
       try {
         const parsed: WorkerEvent = JSON.parse(line);
         onEvent(parsed);
       } catch {
-        console.error("Failed to parse Python worker output:", line);
+        console.error("Bad JSON:", line);
       }
     }
   });
 
   workerProcess.stderr.on("data", (data: Buffer) => {
-    console.error("Python worker stderr:", data.toString());
+    console.error("Python error:", data.toString());
   });
 
-  workerProcess.on("close", (code) => {
-    console.log(`Python worker exited with code ${code}`);
+  workerProcess.on("close", () => {
     workerProcess = null;
   });
+}
+
+export function sendCommand(command: object): void {
+  if (!workerProcess) return;
+
+  workerProcess.stdin.write(JSON.stringify(command) + "\n");
 }
 
 export function stopPythonWorker(): void {
