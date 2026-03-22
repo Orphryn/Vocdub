@@ -6,5 +6,6 @@ contextBridge.exposeInMainWorld("voxdub", {
     ipcRenderer.invoke("set-state", state),
   testNotification: () => ipcRenderer.invoke("test-notification"),
   toggleOverlay: () => ipcRenderer.invoke("toggle-overlay"),
-  saveTranscript: () => ipcRenderer.invoke("save-transcript")
+  saveTranscript: () => ipcRenderer.invoke("save-transcript"),
+  listAudioDevices: () => ipcRenderer.invoke("list-audio-devices")
 });

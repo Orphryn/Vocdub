@@ -5,6 +5,7 @@ export type WorkerEvent = {
   type: string;
   state: "idle" | "monitoring" | "detected" | "dubbing";
   message: string;
+  data?: unknown;
 };
 
 let workerProcess: ChildProcessWithoutNullStreams | null = null;

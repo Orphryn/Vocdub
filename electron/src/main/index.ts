@@ -69,7 +69,7 @@ function getMainWindowHtml(state: AppState): string {
         <div style="padding:24px;">
           <h1>VoxDub Control Center</h1>
           <p>Status: <strong style="color:${stateColor};">${stateLabel}</strong></p>
-          <p>This is the Phase 6 VoxDub shell with a stateful Python monitoring worker.</p>
+          <p>This is the Phase 7 VoxDub shell with audio device discovery.</p>
 
           <div style="margin-top:24px;display:flex;gap:12px;flex-wrap:wrap;">
             <button ${idleDisabled ? "disabled" : ""} onclick="window.voxdub.setState('idle')" style="${getButtonStyle(idleDisabled)}">Stop / Set Idle</button>
@@ -79,6 +79,7 @@ function getMainWindowHtml(state: AppState): string {
             <button onclick="window.voxdub.testNotification()" style="padding:10px 16px;font-size:14px;cursor:pointer;">Test Notification</button>
             <button onclick="window.voxdub.toggleOverlay()" style="padding:10px 16px;font-size:14px;cursor:pointer;">Toggle Overlay</button>
             <button onclick="window.voxdub.saveTranscript()" style="padding:10px 16px;font-size:14px;cursor:pointer;">Save Transcript</button>
+            <button onclick="window.voxdub.listAudioDevices()" style="padding:10px 16px;font-size:14px;cursor:pointer;">List Audio Devices</button>
           </div>
 
           <div style="margin-top:28px;padding:16px;border-radius:12px;background:white;border:1px solid #ddd;max-width:760px;">
@@ -94,6 +95,7 @@ function getMainWindowHtml(state: AppState): string {
               <li>Python command loop works</li>
               <li>Transition guards work</li>
               <li>Automatic monitoring-to-detection flow works</li>
+              <li>Audio device discovery works</li>
             </ul>
           </div>
 
@@ -199,6 +201,11 @@ function handleWorkerEvent(event: WorkerEvent): void {
 
   if (event.type === "state_change") {
     changeState(event.state);
+    return;
+  }
+
+  if (event.type === "audio_devices") {
+    console.log("Audio devices:", event.data);
     return;
   }
 
@@ -327,6 +334,12 @@ function createTray(): void {
       }
     },
     {
+      label: "List Audio Devices",
+      click: () => {
+        sendCommand({ action: "list_audio_devices" });
+      }
+    },
+    {
       type: "separator"
     },
     {
@@ -369,6 +382,10 @@ app.whenReady().then(() => {
 
   ipcMain.handle("save-transcript", async () => {
     return saveTranscript(getState());
+  });
+
+  ipcMain.handle("list-audio-devices", async () => {
+    sendCommand({ action: "list_audio_devices" });
   });
 });
 

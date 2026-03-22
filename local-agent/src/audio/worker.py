@@ -3,6 +3,11 @@ import sys
 import time
 import threading
 
+try:
+    import sounddevice as sd
+except ImportError:
+    sd = None
+
 
 current_state = "idle"
 is_monitoring = False
@@ -10,12 +15,16 @@ detection_sent = False
 lock = threading.Lock()
 
 
-def send_event(event_type: str, state: str, message: str) -> None:
+def send_event(event_type: str, state: str, message: str, data=None) -> None:
     payload = {
         "type": event_type,
         "state": state,
         "message": message
     }
+
+    if data is not None:
+        payload["data"] = data
+
     print(json.dumps(payload), flush=True)
 
 
@@ -37,7 +46,6 @@ def monitoring_loop() -> None:
             if detection_sent:
                 continue
 
-        # Simulate a short delay before language detection succeeds.
         time.sleep(2)
 
         with lock:
@@ -54,6 +62,44 @@ def monitoring_loop() -> None:
             current_state = "detected"
 
         send_event("state_change", "detected", "Foreign language detected automatically")
+
+
+def list_audio_devices() -> None:
+    if sd is None:
+        send_event(
+            "audio_devices",
+            current_state,
+            "sounddevice is not installed",
+            data=[]
+        )
+        return
+
+    try:
+        devices = sd.query_devices()
+        simplified = []
+
+        for index, device in enumerate(devices):
+            simplified.append({
+                "index": index,
+                "name": device.get("name", "Unknown"),
+                "max_input_channels": device.get("max_input_channels", 0),
+                "max_output_channels": device.get("max_output_channels", 0),
+                "default_samplerate": device.get("default_samplerate", 0)
+            })
+
+        send_event(
+            "audio_devices",
+            current_state,
+            f"Found {len(simplified)} audio devices",
+            data=simplified
+        )
+    except Exception as e:
+        send_event(
+            "audio_devices",
+            current_state,
+            f"Failed to list audio devices: {str(e)}",
+            data=[]
+        )
 
 
 def handle_command(command: dict) -> None:
@@ -103,6 +149,9 @@ def handle_command(command: dict) -> None:
             current_state = "detected"
 
         send_event("state_change", "detected", "Foreign language detected manually")
+
+    elif action == "list_audio_devices":
+        list_audio_devices()
 
     else:
         send_event("status", current_state, f"Unknown command: {action}")
