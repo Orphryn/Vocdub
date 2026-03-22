@@ -1,5 +1,7 @@
 import { app, BrowserWindow, Tray, Menu, nativeImage, Notification, ipcMain } from "electron";
 import path from "path";
+import fs from "fs";
+import os from "os";
 
 let tray: Tray | null = null;
 let mainWindow: BrowserWindow | null = null;
@@ -9,6 +11,29 @@ let isQuitting = false;
 type AppState = "idle" | "monitoring" | "detected" | "dubbing";
 
 let currentState: AppState = "idle";
+
+const transcriptLines: Record<AppState, string[]> = {
+  idle: [
+    "[System] VoxDub is idle.",
+    "[System] Waiting for media monitoring to begin."
+  ],
+  monitoring: [
+    "[System] Monitoring browser and local video audio...",
+    "[Detector] Speech activity check active.",
+    "[Detector] Language identification pending."
+  ],
+  detected: [
+    "[Detector] Foreign language detected: Spanish",
+    "[Detector] Confidence: 0.91",
+    "[Prompt] Ready to start dubbing."
+  ],
+  dubbing: [
+    "[STT] Hola, bienvenidos a nuestro programa.",
+    "[Translate] Hello, welcome to our program.",
+    "[TTS] Dubbed voice playback started.",
+    "[System] Overlay active."
+  ]
+};
 
 function htmlToDataUrl(html: string): string {
   return `data:text/html;charset=UTF-8,${encodeURIComponent(html)}`;
@@ -44,6 +69,15 @@ function getStateColor(state: AppState): string {
   }
 }
 
+function getTranscriptHtml(state: AppState): string {
+  return transcriptLines[state]
+    .map(
+      (line) =>
+        `<div style="padding:8px 0;border-bottom:1px solid #eee;font-family:Consolas,monospace;font-size:14px;">${line}</div>`
+    )
+    .join("");
+}
+
 function getMainWindowHtml(state: AppState): string {
   const stateLabel = getStateLabel(state);
   const stateColor = getStateColor(state);
@@ -59,7 +93,7 @@ function getMainWindowHtml(state: AppState): string {
         <div style="padding:24px;">
           <h1>VoxDub Control Center</h1>
           <p>Status: <strong style="color:${stateColor};">${stateLabel}</strong></p>
-          <p>This is the Phase 2 VoxDub shell with simulated app states.</p>
+          <p>This is the Phase 3 VoxDub shell with simulated app states and transcript export.</p>
 
           <div style="margin-top:24px;display:flex;gap:12px;flex-wrap:wrap;">
             <button onclick="window.voxdub.setState('idle')" style="padding:10px 16px;font-size:14px;cursor:pointer;">Set Idle</button>
@@ -68,9 +102,10 @@ function getMainWindowHtml(state: AppState): string {
             <button onclick="window.voxdub.setState('dubbing')" style="padding:10px 16px;font-size:14px;cursor:pointer;">Start Dubbing</button>
             <button onclick="window.voxdub.testNotification()" style="padding:10px 16px;font-size:14px;cursor:pointer;">Test Notification</button>
             <button onclick="window.voxdub.toggleOverlay()" style="padding:10px 16px;font-size:14px;cursor:pointer;">Toggle Overlay</button>
+            <button onclick="window.voxdub.saveTranscript()" style="padding:10px 16px;font-size:14px;cursor:pointer;">Save Transcript</button>
           </div>
 
-          <div style="margin-top:28px;padding:16px;border-radius:12px;background:white;border:1px solid #ddd;max-width:700px;">
+          <div style="margin-top:28px;padding:16px;border-radius:12px;background:white;border:1px solid #ddd;max-width:760px;">
             <h3 style="margin-top:0;">Current Phase</h3>
             <ul>
               <li>Main window works</li>
@@ -78,7 +113,15 @@ function getMainWindowHtml(state: AppState): string {
               <li>Overlay window works</li>
               <li>Notification test works</li>
               <li>App state simulation works</li>
+              <li>Transcript export works</li>
             </ul>
+          </div>
+
+          <div style="margin-top:24px;padding:16px;border-radius:12px;background:white;border:1px solid #ddd;max-width:760px;">
+            <h3 style="margin-top:0;">Transcript Preview</h3>
+            <div style="margin-top:12px;max-height:220px;overflow:auto;border:1px solid #eee;border-radius:8px;padding:0 12px;background:#fafafa;">
+              ${getTranscriptHtml(state)}
+            </div>
           </div>
         </div>
       </body>
@@ -131,10 +174,54 @@ function setState(newState: AppState): void {
   }
 }
 
+function showDetectionNotification(): void {
+  const notification = new Notification({
+    title: "VoxDub",
+    body: "Foreign language detected. Start dubbing?"
+  });
+
+  notification.show();
+}
+
+function toggleOverlay(): void {
+  if (!overlayWindow) return;
+
+  if (overlayWindow.isVisible()) {
+    overlayWindow.hide();
+  } else {
+    overlayWindow.show();
+    overlayWindow.focus();
+  }
+}
+
+function saveTranscriptToFile(): string {
+  const documentsPath = path.join(os.homedir(), "Documents");
+  const voxDubFolder = path.join(documentsPath, "VoxDub");
+
+  if (!fs.existsSync(voxDubFolder)) {
+    fs.mkdirSync(voxDubFolder, { recursive: true });
+  }
+
+  const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const filePath = path.join(voxDubFolder, `transcript-${currentState}-${timestamp}.txt`);
+
+  const contents = [
+    `VoxDub Transcript Export`,
+    `State: ${getStateLabel(currentState)}`,
+    `Created: ${new Date().toString()}`,
+    ``,
+    ...transcriptLines[currentState]
+  ].join("\n");
+
+  fs.writeFileSync(filePath, contents, "utf-8");
+
+  return filePath;
+}
+
 function createMainWindow(): void {
   mainWindow = new BrowserWindow({
-    width: 900,
-    height: 600,
+    width: 950,
+    height: 760,
     show: true,
     webPreferences: {
       preload: path.join(__dirname, "../preload/preload.js"),
@@ -172,26 +259,6 @@ function createOverlayWindow(): void {
   });
 
   overlayWindow.loadURL(htmlToDataUrl(getOverlayHtml(currentState)));
-}
-
-function showDetectionNotification(): void {
-  const notification = new Notification({
-    title: "VoxDub",
-    body: "Foreign language detected. Start dubbing?"
-  });
-
-  notification.show();
-}
-
-function toggleOverlay(): void {
-  if (!overlayWindow) return;
-
-  if (overlayWindow.isVisible()) {
-    overlayWindow.hide();
-  } else {
-    overlayWindow.show();
-    overlayWindow.focus();
-  }
 }
 
 function createTray(): void {
@@ -241,6 +308,16 @@ function createTray(): void {
       }
     },
     {
+      label: "Save Transcript",
+      click: () => {
+        const savedPath = saveTranscriptToFile();
+        new Notification({
+          title: "VoxDub",
+          body: `Transcript saved to ${savedPath}`
+        }).show();
+      }
+    },
+    {
       type: "separator"
     },
     {
@@ -275,6 +352,10 @@ app.whenReady().then(() => {
 
   ipcMain.handle("toggle-overlay", async () => {
     toggleOverlay();
+  });
+
+  ipcMain.handle("save-transcript", async () => {
+    return saveTranscriptToFile();
   });
 });
 
