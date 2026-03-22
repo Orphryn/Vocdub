@@ -1,72 +1,15 @@
 import { app, BrowserWindow, Tray, Menu, nativeImage, Notification, ipcMain } from "electron";
 import path from "path";
-import fs from "fs";
-import os from "os";
+import { AppState, getState, setState, getStateLabel, getStateColor } from "./state-machine";
+import { transcriptLines, saveTranscript } from "./transcript-store";
 
 let tray: Tray | null = null;
 let mainWindow: BrowserWindow | null = null;
 let overlayWindow: BrowserWindow | null = null;
 let isQuitting = false;
 
-type AppState = "idle" | "monitoring" | "detected" | "dubbing";
-
-let currentState: AppState = "idle";
-
-const transcriptLines: Record<AppState, string[]> = {
-  idle: [
-    "[System] VoxDub is idle.",
-    "[System] Waiting for media monitoring to begin."
-  ],
-  monitoring: [
-    "[System] Monitoring browser and local video audio...",
-    "[Detector] Speech activity check active.",
-    "[Detector] Language identification pending."
-  ],
-  detected: [
-    "[Detector] Foreign language detected: Spanish",
-    "[Detector] Confidence: 0.91",
-    "[Prompt] Ready to start dubbing."
-  ],
-  dubbing: [
-    "[STT] Hola, bienvenidos a nuestro programa.",
-    "[Translate] Hello, welcome to our program.",
-    "[TTS] Dubbed voice playback started.",
-    "[System] Overlay active."
-  ]
-};
-
 function htmlToDataUrl(html: string): string {
   return `data:text/html;charset=UTF-8,${encodeURIComponent(html)}`;
-}
-
-function getStateLabel(state: AppState): string {
-  switch (state) {
-    case "idle":
-      return "Idle";
-    case "monitoring":
-      return "Monitoring";
-    case "detected":
-      return "Foreign Language Detected";
-    case "dubbing":
-      return "Dubbing Active";
-    default:
-      return "Unknown";
-  }
-}
-
-function getStateColor(state: AppState): string {
-  switch (state) {
-    case "idle":
-      return "#111";
-    case "monitoring":
-      return "#0b6bcb";
-    case "detected":
-      return "#d97706";
-    case "dubbing":
-      return "#15803d";
-    default:
-      return "#111";
-  }
 }
 
 function getTranscriptHtml(state: AppState): string {
@@ -152,21 +95,23 @@ function getOverlayHtml(state: AppState): string {
 }
 
 function updateWindowsForState(): void {
+  const state = getState();
+
   if (mainWindow) {
-    mainWindow.loadURL(htmlToDataUrl(getMainWindowHtml(currentState)));
+    mainWindow.loadURL(htmlToDataUrl(getMainWindowHtml(state)));
   }
 
   if (overlayWindow) {
-    overlayWindow.loadURL(htmlToDataUrl(getOverlayHtml(currentState)));
+    overlayWindow.loadURL(htmlToDataUrl(getOverlayHtml(state)));
   }
 
   if (tray) {
-    tray.setToolTip(`VoxDub - ${getStateLabel(currentState)}`);
+    tray.setToolTip(`VoxDub - ${getStateLabel(state)}`);
   }
 }
 
-function setState(newState: AppState): void {
-  currentState = newState;
+function changeState(newState: AppState): void {
+  setState(newState);
   updateWindowsForState();
 
   if (newState === "detected") {
@@ -194,30 +139,6 @@ function toggleOverlay(): void {
   }
 }
 
-function saveTranscriptToFile(): string {
-  const documentsPath = path.join(os.homedir(), "Documents");
-  const voxDubFolder = path.join(documentsPath, "VoxDub");
-
-  if (!fs.existsSync(voxDubFolder)) {
-    fs.mkdirSync(voxDubFolder, { recursive: true });
-  }
-
-  const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
-  const filePath = path.join(voxDubFolder, `transcript-${currentState}-${timestamp}.txt`);
-
-  const contents = [
-    `VoxDub Transcript Export`,
-    `State: ${getStateLabel(currentState)}`,
-    `Created: ${new Date().toString()}`,
-    ``,
-    ...transcriptLines[currentState]
-  ].join("\n");
-
-  fs.writeFileSync(filePath, contents, "utf-8");
-
-  return filePath;
-}
-
 function createMainWindow(): void {
   mainWindow = new BrowserWindow({
     width: 950,
@@ -230,7 +151,7 @@ function createMainWindow(): void {
     }
   });
 
-  mainWindow.loadURL(htmlToDataUrl(getMainWindowHtml(currentState)));
+  mainWindow.loadURL(htmlToDataUrl(getMainWindowHtml(getState())));
 
   mainWindow.on("close", (event) => {
     if (!isQuitting) {
@@ -258,7 +179,7 @@ function createOverlayWindow(): void {
     }
   });
 
-  overlayWindow.loadURL(htmlToDataUrl(getOverlayHtml(currentState)));
+  overlayWindow.loadURL(htmlToDataUrl(getOverlayHtml(getState())));
 }
 
 function createTray(): void {
@@ -281,19 +202,19 @@ function createTray(): void {
     },
     {
       label: "Set Idle",
-      click: () => setState("idle")
+      click: () => changeState("idle")
     },
     {
       label: "Start Monitoring",
-      click: () => setState("monitoring")
+      click: () => changeState("monitoring")
     },
     {
       label: "Simulate Detection",
-      click: () => setState("detected")
+      click: () => changeState("detected")
     },
     {
       label: "Start Dubbing",
-      click: () => setState("dubbing")
+      click: () => changeState("dubbing")
     },
     {
       label: "Toggle Overlay",
@@ -310,7 +231,7 @@ function createTray(): void {
     {
       label: "Save Transcript",
       click: () => {
-        const savedPath = saveTranscriptToFile();
+        const savedPath = saveTranscript(getState());
         new Notification({
           title: "VoxDub",
           body: `Transcript saved to ${savedPath}`
@@ -329,7 +250,7 @@ function createTray(): void {
     }
   ]);
 
-  createdTray.setToolTip(`VoxDub - ${getStateLabel(currentState)}`);
+  createdTray.setToolTip(`VoxDub - ${getStateLabel(getState())}`);
   createdTray.setContextMenu(contextMenu);
 
   createdTray.on("click", () => {
@@ -343,7 +264,7 @@ app.whenReady().then(() => {
   createTray();
 
   ipcMain.handle("set-state", async (_event, state: AppState) => {
-    setState(state);
+    changeState(state);
   });
 
   ipcMain.handle("test-notification", async () => {
@@ -355,7 +276,7 @@ app.whenReady().then(() => {
   });
 
   ipcMain.handle("save-transcript", async () => {
-    return saveTranscriptToFile();
+    return saveTranscript(getState());
   });
 });
 
