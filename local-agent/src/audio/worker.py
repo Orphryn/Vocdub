@@ -1,26 +1,45 @@
 import json
 import sys
-import time
 import threading
 
 try:
     import numpy as np
-    import sounddevice as sd
 except ImportError:
     np = None
+
+try:
+    import sounddevice as sd
+except ImportError:
     sd = None
+
+try:
+    from faster_whisper import WhisperModel
+except ImportError:
+    WhisperModel = None
 
 
 current_state = "idle"
 is_monitoring = False
-detection_sent = False
 selected_input_device = None
 input_stream = None
+
 voice_active_frames = 0
+audio_buffer = []
+transcription_in_progress = False
+
+speech_started = False
+silence_frames = 0
+post_trigger_frames = 0
+
 lock = threading.Lock()
 
 VOICE_THRESHOLD = 0.02
 VOICE_FRAMES_REQUIRED = 5
+POST_SPEECH_SILENCE_FRAMES = 20      # ~1.28s silence at 1024/16000
+MAX_POST_TRIGGER_FRAMES = 70         # ~4.5s max after speech starts
+PRE_ROLL_BLOCKS = 40                 # keep ~2.5s before trigger
+MAX_BUFFER_BLOCKS = 220              # total rolling buffer cap
+
 SAMPLE_RATE = 16000
 CHANNELS = 1
 BLOCKSIZE = 1024
@@ -61,8 +80,8 @@ def get_input_devices():
 
 def list_audio_devices() -> None:
     if sd is None:
-      send_event("audio_devices", current_state, "sounddevice is not installed", data=[])
-      return
+        send_event("audio_devices", current_state, "sounddevice is not installed", data=[])
+        return
 
     try:
         devices = get_input_devices()
@@ -96,7 +115,6 @@ def set_default_input_device() -> None:
             if not devices:
                 send_event("status", current_state, "No input devices available")
                 return
-
             default_input = devices[0]["index"]
 
         selected_input_device = int(default_input)
@@ -117,11 +135,106 @@ def set_default_input_device() -> None:
         send_event("status", current_state, f"Failed to set default input device: {str(e)}")
 
 
+def transcribe_audio_chunks(chunks):
+    global transcription_in_progress
+
+    send_event("status", current_state, "Transcription thread started")
+
+    try:
+        if np is None:
+            send_event("status", current_state, "numpy is not installed")
+            return
+
+        if WhisperModel is None:
+            send_event("status", current_state, "faster-whisper is not installed")
+            return
+
+        if not chunks:
+            send_event("status", current_state, "No buffered audio to transcribe")
+            return
+
+        send_event("status", current_state, f"Transcription received {len(chunks)} audio chunks")
+        send_event("status", current_state, "Loading Whisper model (base, int8 on CPU)...")
+
+        model = WhisperModel("base", device="cpu", compute_type="int8")
+
+        audio_data = np.concatenate(chunks, axis=0).astype("float32").flatten()
+        send_event("status", current_state, f"Audio buffer length for transcription: {len(audio_data)} samples")
+
+        segments, info = model.transcribe(
+            audio_data,
+            beam_size=1,
+            vad_filter=True
+        )
+
+        text_parts = []
+        for segment in segments:
+            cleaned = segment.text.strip()
+            if cleaned:
+                text_parts.append(cleaned)
+
+        text = " ".join(text_parts).strip()
+
+        send_event(
+            "status",
+            current_state,
+            f"Whisper finished. Extracted {len(text_parts)} text segments"
+        )
+
+        send_event(
+            "transcription",
+            "detected",
+            text if text else "No speech recognized",
+            data={
+                "text": text,
+                "language": getattr(info, "language", "unknown"),
+                "language_probability": getattr(info, "language_probability", 0.0)
+            }
+        )
+
+    except Exception as e:
+        send_event("status", current_state, f"Transcription failed: {str(e)}")
+    finally:
+        with lock:
+            transcription_in_progress = False
+
+
+def stop_input_stream() -> None:
+    global input_stream
+
+    if input_stream is not None:
+        try:
+            input_stream.stop()
+            input_stream.close()
+        except Exception:
+            pass
+        finally:
+            input_stream = None
+
+
+def finalize_utterance(level: float, buffered_chunks):
+    global current_state
+    global is_monitoring
+    global transcription_in_progress
+
+    send_event("voice_activity", "monitoring", f"Utterance finalized (level={level:.4f})")
+    send_event("state_change", "detected", "Foreign language detected from live microphone activity")
+
+    stop_input_stream()
+
+    thread = threading.Thread(target=transcribe_audio_chunks, args=(buffered_chunks,), daemon=True)
+    thread.start()
+
+
 def audio_callback(indata, frames, time_info, status):
     global current_state
     global is_monitoring
-    global detection_sent
     global voice_active_frames
+    global audio_buffer
+    global transcription_in_progress
+    global speech_started
+    global silence_frames
+    global post_trigger_frames
 
     if status:
         return
@@ -130,31 +243,61 @@ def audio_callback(indata, frames, time_info, status):
         return
 
     try:
-        level = float(np.sqrt(np.mean(indata ** 2)))
+        buffer_copy = indata.copy()
+        level = float(np.sqrt(np.mean(buffer_copy ** 2)))
     except Exception:
         return
+
+    buffered_chunks = None
+    should_finalize = False
 
     with lock:
         if current_state != "monitoring" or not is_monitoring:
             return
+
+        audio_buffer.append(buffer_copy)
+        if len(audio_buffer) > MAX_BUFFER_BLOCKS:
+            audio_buffer = audio_buffer[-MAX_BUFFER_BLOCKS:]
 
         if level > VOICE_THRESHOLD:
             voice_active_frames += 1
         else:
             voice_active_frames = max(0, voice_active_frames - 1)
 
-        if detection_sent:
+        if transcription_in_progress:
             return
 
-        if voice_active_frames < VOICE_FRAMES_REQUIRED:
+        # Before speech starts: keep only rolling pre-roll
+        if not speech_started:
+            if len(audio_buffer) > PRE_ROLL_BLOCKS:
+                audio_buffer = audio_buffer[-PRE_ROLL_BLOCKS:]
+
+            if voice_active_frames >= VOICE_FRAMES_REQUIRED:
+                speech_started = True
+                silence_frames = 0
+                post_trigger_frames = 0
+                send_event("voice_activity", "monitoring", f"Speech started (level={level:.4f})")
+
             return
 
-        detection_sent = True
-        current_state = "detected"
-        is_monitoring = False
+        # After speech has started: keep collecting until silence or max length
+        post_trigger_frames += 1
 
-    send_event("voice_activity", "monitoring", f"Voice activity threshold crossed (level={level:.4f})")
-    send_event("state_change", "detected", "Foreign language detected from live microphone activity")
+        if level > VOICE_THRESHOLD:
+            silence_frames = 0
+        else:
+            silence_frames += 1
+
+        if silence_frames >= POST_SPEECH_SILENCE_FRAMES or post_trigger_frames >= MAX_POST_TRIGGER_FRAMES:
+            transcription_in_progress = True
+            current_state = "detected"
+            is_monitoring = False
+            buffered_chunks = list(audio_buffer)
+            audio_buffer = []
+            should_finalize = True
+
+    if should_finalize and buffered_chunks is not None:
+        finalize_utterance(level, buffered_chunks)
 
 
 def start_input_stream_if_needed() -> None:
@@ -195,24 +338,25 @@ def start_input_stream_if_needed() -> None:
         send_event("status", current_state, f"Failed to start input stream: {str(e)}")
 
 
-def stop_input_stream() -> None:
-    global input_stream
+def reset_monitoring_state():
+    global voice_active_frames
+    global audio_buffer
+    global transcription_in_progress
+    global speech_started
+    global silence_frames
+    global post_trigger_frames
 
-    if input_stream is not None:
-        try:
-            input_stream.stop()
-            input_stream.close()
-        except Exception:
-            pass
-        finally:
-            input_stream = None
+    voice_active_frames = 0
+    audio_buffer = []
+    transcription_in_progress = False
+    speech_started = False
+    silence_frames = 0
+    post_trigger_frames = 0
 
 
 def handle_command(command: dict) -> None:
     global current_state
     global is_monitoring
-    global detection_sent
-    global voice_active_frames
 
     action = command.get("action")
 
@@ -223,8 +367,7 @@ def handle_command(command: dict) -> None:
                 return
 
             is_monitoring = True
-            detection_sent = False
-            voice_active_frames = 0
+            reset_monitoring_state()
             current_state = "monitoring"
 
         start_input_stream_if_needed()
@@ -243,8 +386,7 @@ def handle_command(command: dict) -> None:
     elif action == "stop":
         with lock:
             is_monitoring = False
-            detection_sent = False
-            voice_active_frames = 0
+            reset_monitoring_state()
             current_state = "idle"
 
         stop_input_stream()
@@ -256,10 +398,10 @@ def handle_command(command: dict) -> None:
                 send_event("status", current_state, "Cannot simulate detection unless monitoring")
                 return
 
-            detection_sent = True
-            current_state = "detected"
             is_monitoring = False
+            current_state = "detected"
 
+        stop_input_stream()
         send_event("state_change", "detected", "Foreign language detected manually")
 
     elif action == "list_audio_devices":
@@ -272,23 +414,8 @@ def handle_command(command: dict) -> None:
         send_event("status", current_state, f"Unknown command: {action}")
 
 
-def health_loop() -> None:
-    while True:
-        time.sleep(1)
-
-        with lock:
-            active = is_monitoring
-            state = current_state
-
-        if active and state == "monitoring":
-            pass
-
-
 def main() -> None:
     send_event("status", "idle", "Worker ready")
-
-    thread = threading.Thread(target=health_loop, daemon=True)
-    thread.start()
 
     while True:
         line = sys.stdin.readline()
