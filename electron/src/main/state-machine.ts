@@ -2,30 +2,23 @@ export type AppState = "idle" | "monitoring" | "detected" | "dubbing";
 
 let currentState: AppState = "idle";
 
-const allowedTransitions: Record<AppState, AppState[]> = {
+const TRANSITIONS: Record<AppState, AppState[]> = {
   idle: ["monitoring"],
   monitoring: ["detected", "idle"],
-  detected: ["dubbing", "idle"],
-  dubbing: ["idle"]
+  detected: ["dubbing", "monitoring", "idle"],  // added monitoring for auto-resume
+  dubbing: ["idle"],
 };
 
 export function getState(): AppState {
   return currentState;
 }
 
-export function canTransitionTo(nextState: AppState): boolean {
-  if (nextState === currentState) {
-    return false;
-  }
-
-  return allowedTransitions[currentState].includes(nextState);
+export function canTransitionTo(next: AppState): boolean {
+  return next !== currentState && TRANSITIONS[currentState].includes(next);
 }
 
 export function setState(state: AppState): boolean {
-  if (!canTransitionTo(state)) {
-    return false;
-  }
-
+  if (!canTransitionTo(state)) return false;
   currentState = state;
   return true;
 }
@@ -34,28 +27,24 @@ export function forceState(state: AppState): void {
   currentState = state;
 }
 
+const STATE_LABELS: Record<AppState, string> = {
+  idle: "Idle",
+  monitoring: "Monitoring",
+  detected: "Speech Detected",
+  dubbing: "Dubbing Active",
+};
+
+const STATE_COLORS: Record<AppState, string> = {
+  idle: "#6b7280",
+  monitoring: "#3b82f6",
+  detected: "#f59e0b",
+  dubbing: "#22c55e",
+};
+
 export function getStateLabel(state: AppState): string {
-  switch (state) {
-    case "idle":
-      return "Idle";
-    case "monitoring":
-      return "Monitoring";
-    case "detected":
-      return "Foreign Language Detected";
-    case "dubbing":
-      return "Dubbing Active";
-  }
+  return STATE_LABELS[state];
 }
 
 export function getStateColor(state: AppState): string {
-  switch (state) {
-    case "idle":
-      return "#111";
-    case "monitoring":
-      return "#0b6bcb";
-    case "detected":
-      return "#d97706";
-    case "dubbing":
-      return "#15803d";
-  }
+  return STATE_COLORS[state];
 }
