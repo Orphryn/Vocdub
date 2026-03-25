@@ -1,203 +1,96 @@
-"""VoxDub Python Audio Worker — Production Build
+"""VoxDub Audio Worker v0.4.0 — Production Build
 
-Real-time speech → transcription → translation pipeline.
-Communicates with Electron via JSON-over-stdin/stdout.
+Architecture:
+  MIC mode:   sounddevice InputStream → VAD → stop stream → Whisper → resume
+  SYSTEM mode: WASAPI loopback (PyAudioWPatch) → VAD → Whisper (stream stays alive) → resume
 
-Optimizations over previous versions:
-  - Whisper initial_prompt hints improve language detection accuracy
-  - Audio normalization before transcription (prevents clipping/quiet issues)
-  - Adaptive voice threshold with noise floor tracking
-  - Continuous monitoring: auto-resumes after transcription completes
-  - Pre-warms translation model on first non-English detection
-  - Graceful shutdown with proper thread joining
-  - Reduced memory: ring buffer with numpy array instead of list
+Known issues addressed:
+  1. Translation hallucination ("no, no, no..." ×50) → output length cap + repetition penalty
+  2. Music/SFX false triggers → energy + duration gating, Silero VAD inside Whisper
+  3. Single-word fragments ("¡Ah!") → minimum word count for system audio
+  4. Segfault 0xC0000005 → main-thread model preload, PortAudio teardown delay
+  5. Slow transcription → tiny model for system audio, beam_size=1, 8 CPU threads
+  6. Stream dying during transcription → loopback reader stays alive in detected state
+  7. Noise floor contamination → separate thresholds per source, reset on switch
+  8. Auto-resume race condition → check pa_stream before restarting
 """
 
-import io
-import json
-import os
-import sys
-import threading
-import time
-import traceback
+import io, json, os, sys, threading, time, traceback
+from collections import Counter
 
-os.environ["PYTHONIOENCODING"] = "utf-8"
-os.environ["PYTHONUTF8"] = "1"
-os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
-os.environ["TOKENIZERS_PARALLELISM"] = "false"
+os.environ.update({
+    "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1",
+    "HF_HUB_DISABLE_SYMLINKS_WARNING": "1", "TOKENIZERS_PARALLELISM": "false",
+})
 
-sys.stdout = io.TextIOWrapper(
-    sys.stdout.buffer, encoding="utf-8", errors="replace", line_buffering=True
-)
-sys.stderr = io.TextIOWrapper(
-    sys.stderr.buffer, encoding="utf-8", errors="replace", line_buffering=True
-)
+for stream in (sys.stdout, sys.stderr):
+    if hasattr(stream, "buffer"):
+        wrapped = io.TextIOWrapper(stream.buffer, encoding="utf-8", errors="replace", line_buffering=True)
+        if stream is sys.stdout:
+            sys.stdout = wrapped
+        else:
+            sys.stderr = wrapped
 
-try:
-    import numpy as np
-except ImportError:
-    np = None
-
-try:
-    import sounddevice as sd
-except ImportError:
-    sd = None
-
-try:
-    from faster_whisper import WhisperModel
-except ImportError:
-    WhisperModel = None
-
-try:
-    from transformers import MarianMTModel, MarianTokenizer
-except ImportError:
-    MarianMTModel = None
-    MarianTokenizer = None
+try: import numpy as np
+except ImportError: np = None
+try: import sounddevice as sd
+except ImportError: sd = None
+try: import pyaudiowpatch as pyaudio
+except ImportError: pyaudio = None
+try: from faster_whisper import WhisperModel
+except ImportError: WhisperModel = None
+try: from transformers import MarianMTModel, MarianTokenizer
+except ImportError: MarianMTModel = MarianTokenizer = None
 
 
-# ━━ Global State ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ═══════════════════════════════════════════════════════════════════════════════
+# CONFIGURATION
+# ═══════════════════════════════════════════════════════════════════════════════
 
-current_state = "idle"
-is_monitoring = False
-selected_input_device = None
-input_stream = None
-
-voice_active_frames = 0
-audio_buffer: list = []
-transcription_in_progress = False
-
-speech_started = False
-silence_frames = 0
-post_trigger_frames = 0
-
-# Adaptive noise floor tracking
-noise_floor = 0.005
-noise_samples = 0
-
-lock = threading.Lock()
-shutdown_event = threading.Event()
-
-# ━━ Tuning Constants ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-# Voice detection
-VOICE_THRESHOLD_MULTIPLIER = 3.0  # voice must be 3x the noise floor
-VOICE_THRESHOLD_MIN = 0.015       # absolute minimum threshold
-VOICE_THRESHOLD_MAX = 0.15        # absolute maximum threshold
-VOICE_FRAMES_REQUIRED = 5
-NOISE_FLOOR_ALPHA = 0.02          # exponential moving average for noise
-
-# Speech capture timing
-POST_SPEECH_SILENCE_FRAMES = 45
-MAX_POST_TRIGGER_FRAMES = 140
-PRE_ROLL_BLOCKS = 40
-MAX_BUFFER_BLOCKS = 320
-
-# Audio config
 SAMPLE_RATE = 16000
 CHANNELS = 1
 BLOCKSIZE = 1024
+BLOCK_DURATION = BLOCKSIZE / SAMPLE_RATE  # 0.064s per block
 
-# Confidence & safety
-MIN_LANGUAGE_CONFIDENCE = 0.45    # lowered — small model on non-native is often 0.5-0.6
-STREAM_TEARDOWN_DELAY = 0.35      # seconds between stream stop and Whisper inference
+# CPU threading — adjust to your core count
+CPU_THREADS = 8
 
-# Auto-resume: after transcription, automatically go back to monitoring
-AUTO_RESUME_MONITORING = True
+# ── Mic VAD ───────────────────────────────────────────────────────────────────
+MIC_THRESHOLD_MULTIPLIER = 3.0
+MIC_THRESHOLD_MIN = 0.015
+MIC_THRESHOLD_MAX = 0.15
+MIC_FRAMES_REQUIRED = 5           # 320ms of voice to trigger
+MIC_SILENCE_FRAMES = 45           # 2.9s silence to finalize
+MIC_MAX_CAPTURE_FRAMES = 140      # 9.0s max capture
+MIC_PRE_ROLL = 40
+MIC_MAX_BUFFER = 320
+MIC_NOISE_ALPHA = 0.02
 
-# ━━ Model Singletons ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ── System Audio VAD ─────────────────────────────────────────────────────────
+# Tuned from actual NVIDIA HDMI loopback measurements:
+#   Silence: 0.000 - 0.003
+#   Quiet music/ambience: 0.003 - 0.020
+#   Clear dialogue: 0.050 - 0.220
+#
+# Threshold at 0.025 catches all dialogue, skips silence and quiet ambience.
+# 8 frames required (512ms) prevents brief music hits from triggering.
+# 35 silence frames (2.2s) bridges gaps between words/phrases within a sentence.
+SYS_THRESHOLD = 0.025
+SYS_FRAMES_REQUIRED = 8
+SYS_SILENCE_FRAMES = 35           # 2.2s silence to finalize
+SYS_MAX_CAPTURE_FRAMES = 110      # 7.0s max capture — full TV lines
+SYS_PRE_ROLL = 20
+SYS_MAX_BUFFER = 160
+SYS_MIN_SPEECH_SECONDS = 1.5      # skip captures shorter than this
+SYS_MIN_WORDS = 2                 # skip single-word results
 
-whisper_model = None
-whisper_model_lock = threading.Lock()
+# ── Shared ────────────────────────────────────────────────────────────────────
+MIN_LANGUAGE_CONFIDENCE = 0.40
+STREAM_TEARDOWN_DELAY = 0.35
+AUTO_RESUME = True
 
-translation_cache: dict[str, tuple] = {}
-translation_cache_lock = threading.Lock()
-
-
-# ━━ Event Emitter ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-def send_event(event_type: str, state: str, message: str, data=None) -> None:
-    payload = {"type": event_type, "state": state, "message": message}
-    if data is not None:
-        payload["data"] = data
-    try:
-        print(json.dumps(payload, ensure_ascii=False), flush=True)
-    except Exception:
-        pass
-
-
-# ━━ Audio Devices ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-def get_input_devices():
-    if sd is None:
-        return []
-    devices = sd.query_devices()
-    return [
-        {
-            "index": i,
-            "name": d.get("name", "Unknown"),
-            "max_input_channels": d.get("max_input_channels", 0),
-            "default_samplerate": d.get("default_samplerate", 0),
-        }
-        for i, d in enumerate(devices)
-        if d.get("max_input_channels", 0) > 0
-    ]
-
-
-def list_audio_devices() -> None:
-    if sd is None:
-        send_event("audio_devices", current_state, "sounddevice not installed", data=[])
-        return
-    try:
-        devices = get_input_devices()
-        send_event("audio_devices", current_state, f"Found {len(devices)} input devices", data=devices)
-    except Exception as e:
-        send_event("audio_devices", current_state, f"Device list failed: {e}", data=[])
-
-
-def set_default_input_device() -> None:
-    global selected_input_device
-    if sd is None:
-        send_event("status", current_state, "sounddevice not installed")
-        return
-    try:
-        default_input = sd.default.device[0]
-        devices = get_input_devices()
-        if default_input is None or default_input == -1:
-            if not devices:
-                send_event("status", current_state, "No input devices available")
-                return
-            default_input = devices[0]["index"]
-        selected_input_device = int(default_input)
-        name = next((d["name"] for d in devices if d["index"] == selected_input_device), "Unknown")
-        send_event("device_selected", current_state, f"Using input device: {name}",
-                    data={"index": selected_input_device, "name": name})
-    except Exception as e:
-        send_event("status", current_state, f"Failed to set default input device: {e}")
-
-
-# ━━ Model Loading ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-def ensure_whisper_model():
-    global whisper_model
-    if whisper_model is not None:
-        return whisper_model
-    with whisper_model_lock:
-        if whisper_model is not None:
-            return whisper_model
-        if WhisperModel is None:
-            send_event("status", current_state, "faster-whisper not installed")
-            return None
-        send_event("status", current_state, "Loading Whisper model (small, int8)...")
-        try:
-            whisper_model = WhisperModel("small", device="cpu", compute_type="int8")
-            send_event("status", current_state, "Whisper model loaded")
-        except Exception as e:
-            send_event("status", current_state, f"Whisper load failed: {e}")
-            whisper_model = None
-    return whisper_model
-
-
-TRANSLATION_MODEL_MAP = {
+# ── Translation ───────────────────────────────────────────────────────────────
+TRANSLATION_MODELS = {
     "pt": "Helsinki-NLP/opus-mt-ROMANCE-en",
     "fr": "Helsinki-NLP/opus-mt-ROMANCE-en",
     "es": "Helsinki-NLP/opus-mt-ROMANCE-en",
@@ -212,494 +105,968 @@ TRANSLATION_MODEL_MAP = {
     "hi": "Helsinki-NLP/opus-mt-hi-en",
 }
 
-
-def get_translation_model_name(source_language: str) -> str | None:
-    return TRANSLATION_MODEL_MAP.get(source_language)
-
-
-def ensure_translation_model(source_language: str):
-    if MarianMTModel is None or MarianTokenizer is None:
-        return None, None
-    model_name = get_translation_model_name(source_language)
-    if model_name is None:
-        return None, None
-    if model_name in translation_cache:
-        return translation_cache[model_name]
-    with translation_cache_lock:
-        if model_name in translation_cache:
-            return translation_cache[model_name]
-        send_event("status", current_state, f"Loading translation model: {model_name}")
-        try:
-            tokenizer = MarianTokenizer.from_pretrained(model_name)
-            model = MarianMTModel.from_pretrained(model_name)
-            translation_cache[model_name] = (tokenizer, model)
-            send_event("status", current_state, f"Translation model loaded: {model_name}")
-            return tokenizer, model
-        except Exception as e:
-            send_event("status", current_state, f"Translation model load failed: {e}")
-            return None, None
+JUNK_PHRASES = frozenset([
+    "thank you for watching", "thanks for watching", "please subscribe",
+    "subscribe to my channel", "thank you", "thanks", "bye", "you",
+    "subtitles by the amara.org community", "amara.org",
+    "ah", "oh", "uh", "um", "hmm", "hm", "eh", "mhm",
+])
 
 
-def preload_models() -> None:
-    send_event("status", "idle", "Pre-loading models...")
-    ensure_whisper_model()
-    send_event("status", "idle", "Model pre-load complete")
+# ═══════════════════════════════════════════════════════════════════════════════
+# STATE
+# ═══════════════════════════════════════════════════════════════════════════════
+
+state = "idle"
+monitoring = False
+audio_source = "mic"
+selected_mic = None
+
+# Streams
+sd_stream = None
+pa_inst = None
+pa_stream = None
+loopback_info = None
+loopback_thread = None
+
+# VAD
+vad_voice_frames = 0
+vad_buffer: list = []
+vad_in_progress = False
+vad_speech_on = False
+vad_silence = 0
+vad_trigger = 0
+noise_floor = 0.005
+noise_n = 0
+
+# Language tracking
+lang_history: list[str] = []
+
+lock = threading.Lock()
+shutdown = threading.Event()
+
+# Models
+_whisper_small = None
+_whisper_tiny = None
+_whisper_lock = threading.Lock()
+_tl_cache: dict[str, tuple] = {}
+_tl_lock = threading.Lock()
 
 
-# ━━ Translation ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ═══════════════════════════════════════════════════════════════════════════════
+# EVENTS
+# ═══════════════════════════════════════════════════════════════════════════════
 
-def translate_text(text: str, source_language: str, target_language: str = "en") -> str:
-    if not text.strip() or source_language == target_language:
-        return text
-    tokenizer, model = ensure_translation_model(source_language)
-    if tokenizer is None or model is None:
-        send_event("status", current_state,
-                    f"No translation model for {source_language} → {target_language}")
-        return text
+def emit(etype: str, msg: str, data=None):
+    p = {"type": etype, "state": state, "message": msg}
+    if data is not None:
+        p["data"] = data
     try:
-        inputs = tokenizer([text], return_tensors="pt", padding=True, truncation=True)
-        tokens = model.generate(**inputs, num_beams=4, max_length=512)
-        return tokenizer.decode(tokens[0], skip_special_tokens=True)
-    except Exception as e:
-        send_event("status", current_state, f"Translation failed: {e}")
-        return text
+        print(json.dumps(p, ensure_ascii=False), flush=True)
+    except Exception:
+        pass
 
 
-# ━━ Text Cleaning ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ═══════════════════════════════════════════════════════════════════════════════
+# AUDIO UTILITIES
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def normalize(a):
+    pk = np.max(np.abs(a))
+    return (a / pk * 0.95) if pk > 0.001 else a
+
+def resample(a, src, dst):
+    if src == dst: return a
+    r = dst / src
+    n = int(len(a) * r)
+    ix = np.clip(np.arange(n) / r, 0, len(a) - 1)
+    fl = np.floor(ix).astype(int)
+    cl = np.minimum(fl + 1, len(a) - 1)
+    fr = ix - fl
+    return a[fl] * (1 - fr) + a[cl] * fr
+
+def to_mono(a, ch):
+    if ch <= 1: return a
+    n = len(a) // ch
+    return a[:n * ch].reshape(n, ch).mean(axis=1)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# VAD HELPERS (source-aware)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _threshold():
+    if audio_source == "system":
+        return SYS_THRESHOLD
+    t = noise_floor * MIC_THRESHOLD_MULTIPLIER
+    return max(MIC_THRESHOLD_MIN, min(MIC_THRESHOLD_MAX, t))
+
+def _frames_req():
+    return SYS_FRAMES_REQUIRED if audio_source == "system" else MIC_FRAMES_REQUIRED
+
+def _silence_req():
+    return SYS_SILENCE_FRAMES if audio_source == "system" else MIC_SILENCE_FRAMES
+
+def _max_trigger():
+    return SYS_MAX_CAPTURE_FRAMES if audio_source == "system" else MIC_MAX_CAPTURE_FRAMES
+
+def _pre_roll():
+    return SYS_PRE_ROLL if audio_source == "system" else MIC_PRE_ROLL
+
+def _max_buf():
+    return SYS_MAX_BUFFER if audio_source == "system" else MIC_MAX_BUFFER
+
+def _update_noise(level):
+    global noise_floor, noise_n
+    if audio_source != "mic" or vad_speech_on:
+        return
+    if noise_n < 50:
+        noise_floor = (noise_floor * noise_n + level) / (noise_n + 1)
+        noise_n += 1
+    else:
+        noise_floor = (1 - MIC_NOISE_ALPHA) * noise_floor + MIC_NOISE_ALPHA * level
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# POST-PROCESSING PIPELINE
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# Sits between Whisper raw output and translation. Catches every known
+# failure mode of Whisper and MarianMT:
+#
+#   1. Hallucination loops: "a ir a ir a ir a ir..." → blocked
+#   2. Repetitive phrases: "No, no, no, no, no" → "No"
+#   3. Junk/boilerplate: "Thank you for watching" → blocked
+#   4. Music/SFX noise: "[Music]", "♪♪♪" → blocked
+#   5. Single-word fragments in system mode → blocked
+#   6. Encoding artifacts: fix common UTF-8 issues
+#   7. Context dedup: skip if identical to last N transcriptions
+#
+# Each stage returns the cleaned text or "" to skip entirely.
+
+import re
+
+# ── Stage 0: Known junk phrases ──────────────────────────────────────────────
 
 JUNK_PHRASES = frozenset([
     "thank you for watching", "thanks for watching", "please subscribe",
     "subscribe to my channel", "thank you", "thanks", "bye", "you",
     "subtitles by the amara.org community", "amara.org",
-    "sous-titres réalisés para la communauté d'amara.org",
+    "sous-titres par la communaute d'amara.org",
+    "ah", "oh", "uh", "um", "hmm", "hm", "eh", "mhm", "shh",
+    "music", "musica", "musique", "applause", "laughter", "risas",
 ])
 
+# ── Stage 1: Hallucination / repetition detector ─────────────────────────────
 
-def clean_transcription(text: str) -> str:
-    if not text:
+def _detect_repetition(text: str) -> bool:
+    """Detect if text contains excessive repetition (Whisper hallucination).
+    
+    Catches patterns like:
+      - "a ir a ir a ir a ir a ir a ir"
+      - "no, no, no, no, no, no, no"
+      - "go go go go go go"
+      - repeated 2-3 word phrases
+    
+    Returns True if text is hallucinated/repetitive.
+    """
+    words = text.lower().split()
+    if len(words) < 4:
+        return False
+    
+    # Check 1: Single word repeated many times
+    # "no no no no no" or "go go go go"
+    from collections import Counter
+    counts = Counter(words)
+    most_common_word, most_count = counts.most_common(1)[0]
+    if most_count >= len(words) * 0.6 and len(words) >= 5:
+        return True
+    
+    # Check 2: 2-gram repetition
+    # "a ir a ir a ir" → bigram "a ir" appears 3+ times
+    if len(words) >= 6:
+        bigrams = [f"{words[i]} {words[i+1]}" for i in range(len(words)-1)]
+        bi_counts = Counter(bigrams)
+        top_bi, top_bi_n = bi_counts.most_common(1)[0]
+        if top_bi_n >= 3 and top_bi_n >= len(bigrams) * 0.4:
+            return True
+    
+    # Check 3: 3-gram repetition
+    # "me voy a me voy a me voy a"
+    if len(words) >= 9:
+        trigrams = [f"{words[i]} {words[i+1]} {words[i+2]}" for i in range(len(words)-2)]
+        tri_counts = Counter(trigrams)
+        top_tri, top_tri_n = tri_counts.most_common(1)[0]
+        if top_tri_n >= 3 and top_tri_n >= len(trigrams) * 0.35:
+            return True
+    
+    # Check 4: Character-level repetition ratio
+    # If any single character makes up >40% of the text (excluding spaces)
+    chars = text.replace(" ", "").lower()
+    if len(chars) > 10:
+        char_counts = Counter(chars)
+        top_char, top_char_n = char_counts.most_common(1)[0]
+        if top_char_n / len(chars) > 0.4 and top_char not in "aeiouns":
+            return True
+    
+    return False
+
+
+def _collapse_repetition(text: str) -> str:
+    """If text has mild repetition, collapse it rather than blocking entirely.
+    
+    "No, no, no, no" → "No"
+    "Sí, sí, sí" → "Sí"
+    But keeps natural repetition like "poco a poco" (little by little).
+    """
+    words = text.split()
+    if len(words) < 3:
+        return text
+    
+    # Check if it's a simple repeated word/phrase with punctuation
+    # "No, no, no, no" → strip punctuation, check if all same
+    stripped = [re.sub(r'[,;.!?¡¿\s]+', '', w).lower() for w in words]
+    stripped = [w for w in stripped if w]
+    
+    if not stripped:
+        return text
+    
+    counts = Counter(stripped)
+    most, n = counts.most_common(1)[0]
+    
+    # If one word is >70% of all words, collapse to just that word
+    if n >= len(stripped) * 0.7 and n >= 3:
+        # Find the original cased version
+        for w in words:
+            if re.sub(r'[,;.!?¡¿\s]+', '', w).lower() == most:
+                return w.rstrip(",;.!? ")
+    
+    return text
+
+
+# ── Stage 2: Music / sound effect detection ──────────────────────────────────
+
+MUSIC_PATTERNS = re.compile(
+    r'^\s*[\[(\{]?\s*(music|musica|musique|musik|applause|laughter|risas|'
+    r'singing|cantando|chanting|humming|instrumental|silence|inaudible|'
+    r'foreign language|speaks? \w+)\s*[\])\}]?\s*$',
+    re.IGNORECASE
+)
+
+MUSIC_CHARS = set("♪♫🎵🎶🎵🎤")
+
+
+def _is_music_or_sfx(text: str) -> bool:
+    """Detect music markers, sound effects, and non-speech audio descriptions."""
+    if any(c in MUSIC_CHARS for c in text):
+        return True
+    if MUSIC_PATTERNS.match(text.strip()):
+        return True
+    # Pure punctuation or symbols
+    cleaned = re.sub(r'[\s\W]+', '', text)
+    if len(cleaned) < 2:
+        return True
+    return False
+
+
+# ── Stage 3: Context deduplication ───────────────────────────────────────────
+
+_recent_outputs: list[str] = []
+MAX_RECENT = 5
+
+
+def _is_duplicate(text: str) -> bool:
+    """Skip if we just emitted the same or very similar text."""
+    normalized = text.lower().strip().rstrip(".!?")
+    for prev in _recent_outputs:
+        if normalized == prev:
+            return True
+        # Fuzzy: if >80% of words overlap, it's a duplicate
+        words_new = set(normalized.split())
+        words_old = set(prev.split())
+        if words_new and words_old:
+            overlap = len(words_new & words_old) / max(len(words_new), len(words_old))
+            if overlap > 0.8:
+                return True
+    return False
+
+
+def _record_output(text: str):
+    normalized = text.lower().strip().rstrip(".!?")
+    _recent_outputs.append(normalized)
+    if len(_recent_outputs) > MAX_RECENT:
+        _recent_outputs.pop(0)
+
+
+# ── Master post-processing function ──────────────────────────────────────────
+
+def postprocess(raw_text: str) -> str:
+    """Full post-processing pipeline. Returns cleaned text or "" to skip.
+    
+    Pipeline stages:
+      0. Basic cleanup (whitespace, encoding, music chars)
+      1. Junk phrase filter
+      2. Music / SFX detection
+      3. Hallucination / repetition detection
+      4. Repetition collapsing (mild cases)
+      5. Minimum length / word count gate
+      6. Context deduplication
+    """
+    if not raw_text:
         return ""
-    # Strip Whisper artifacts
-    text = text.replace("...", "").replace("…", "").strip()
-    text = text.strip("♪").strip("🎵").strip()
-    # Check for junk
-    normalized = text.strip().rstrip(".!?").lower()
+    
+    # Stage 0: Basic cleanup
+    text = raw_text.strip()
+    text = text.replace("...", "").replace("…", "")
+    text = text.strip("♪🎵♫🎶🎤")
+    text = re.sub(r'\s+', ' ', text).strip()
+    
+    if len(text) < 2:
+        return ""
+    
+    # Stage 1: Known junk phrases
+    normalized = text.rstrip(".!?¡¿,;: ").lower()
     if normalized in JUNK_PHRASES:
         return ""
-    # Too short to be meaningful
+    
+    # Stage 2: Music / SFX
+    if _is_music_or_sfx(text):
+        return ""
+    
+    # Stage 3: Hallucination detection (severe repetition → block entirely)
+    if _detect_repetition(text):
+        emit("status", f"Hallucination blocked: {text[:80]}...")
+        return ""
+    
+    # Stage 4: Mild repetition collapsing
+    text = _collapse_repetition(text)
+    
+    # Stage 5: Minimum content gate
     if len(text) < 3:
         return ""
+    if audio_source == "system":
+        meaningful_words = [w for w in text.split() if len(w) > 1]
+        if len(meaningful_words) < SYS_MIN_WORDS:
+            return ""
+    
+    # Stage 6: Context deduplication
+    if _is_duplicate(text):
+        emit("status", f"Duplicate skipped: {text[:60]}")
+        return ""
+    
     return text.strip()
 
 
-# ━━ Audio Normalization ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ═══════════════════════════════════════════════════════════════════════════════
+# LANGUAGE HINTS
+# ═══════════════════════════════════════════════════════════════════════════════
 
-def normalize_audio(audio: "np.ndarray") -> "np.ndarray":
-    """Peak-normalize audio to [-1, 1] range for consistent Whisper input."""
-    peak = np.max(np.abs(audio))
-    if peak > 0.001:
-        return audio / peak * 0.95  # leave 5% headroom
-    return audio
-
-
-# ━━ Adaptive Voice Threshold ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-def get_voice_threshold() -> float:
-    """Dynamic threshold based on tracked noise floor."""
-    threshold = noise_floor * VOICE_THRESHOLD_MULTIPLIER
-    return max(VOICE_THRESHOLD_MIN, min(VOICE_THRESHOLD_MAX, threshold))
-
-
-def update_noise_floor(level: float) -> None:
-    """Update noise floor estimate with exponential moving average.
-    Only update when we're NOT in active speech."""
-    global noise_floor, noise_samples
-    if not speech_started:
-        if noise_samples < 50:
-            # Bootstrap: simple average for first 50 samples
-            noise_floor = (noise_floor * noise_samples + level) / (noise_samples + 1)
-            noise_samples += 1
-        else:
-            noise_floor = (1 - NOISE_FLOOR_ALPHA) * noise_floor + NOISE_FLOOR_ALPHA * level
-
-
-# ━━ Whisper Language Hints ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-# Recent language detections for biasing Whisper
-recent_languages: list[str] = []
-MAX_LANGUAGE_HISTORY = 5
-
-
-def get_language_hint() -> str | None:
-    """If we've been hearing a consistent language, hint Whisper to expect it."""
-    if len(recent_languages) < 2:
+def lang_hint():
+    if len(lang_history) < 2:
         return None
-    # Most common recent language
-    from collections import Counter
-    counts = Counter(recent_languages)
-    most_common, count = counts.most_common(1)[0]
-    if count >= 2 and most_common != "en":
-        return most_common
-    return None
+    best, n = Counter(lang_history).most_common(1)[0]
+    return best if n >= 2 and best != "en" else None
+
+def record_lang(lang):
+    lang_history.append(lang)
+    if len(lang_history) > 5:
+        lang_history.pop(0)
 
 
-def record_language(lang: str) -> None:
-    """Track recently detected languages."""
-    recent_languages.append(lang)
-    if len(recent_languages) > MAX_LANGUAGE_HISTORY:
-        recent_languages.pop(0)
+# ═══════════════════════════════════════════════════════════════════════════════
+# DEVICES
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _mic_devices():
+    if sd is None: return []
+    return [{"index": i, "name": d.get("name", "?"), "channels": d.get("max_input_channels", 0)}
+            for i, d in enumerate(sd.query_devices()) if d.get("max_input_channels", 0) > 0]
+
+def set_mic():
+    global selected_mic
+    if sd is None: return
+    try:
+        di = sd.default.device[0]
+        devs = _mic_devices()
+        if di is None or di == -1:
+            if not devs: return
+            di = devs[0]["index"]
+        selected_mic = int(di)
+        name = next((d["name"] for d in devs if d["index"] == selected_mic), "?")
+        emit("device_selected", f"Mic: {name}", {"name": name, "source": "mic"})
+    except Exception as e:
+        emit("status", f"Mic error: {e}")
+
+def set_loopback():
+    global loopback_info
+    if pyaudio is None:
+        emit("status", "PyAudioWPatch not installed — pip install PyAudioWPatch")
+        return
+    try:
+        p = pyaudio.PyAudio()
+        loopback_info = p.get_default_wasapi_loopback()
+        p.terminate()
+        name = loopback_info.get("name", "?")
+        rate = int(loopback_info.get("defaultSampleRate", 0))
+        ch = loopback_info.get("maxInputChannels", 0)
+        emit("device_selected", f"Loopback: {name} ({rate}Hz {ch}ch)",
+             {"name": name, "sampleRate": rate, "channels": ch, "source": "system"})
+    except Exception as e:
+        loopback_info = None
+        emit("status", f"No loopback: {e}")
+
+def list_devices():
+    mic = _mic_devices()
+    lb = []
+    if pyaudio:
+        try:
+            p = pyaudio.PyAudio()
+            for d in p.get_loopback_device_info_generator():
+                lb.append({"index": d["index"], "name": d["name"],
+                           "channels": d["maxInputChannels"], "rate": int(d["defaultSampleRate"])})
+            p.terminate()
+        except Exception: pass
+    emit("audio_devices", f"{len(mic)} mic + {len(lb)} loopback", {"mic": mic, "loopback": lb})
 
 
-# ━━ Transcription Pipeline ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ═══════════════════════════════════════════════════════════════════════════════
+# MODELS
+# ═══════════════════════════════════════════════════════════════════════════════
 
-def transcribe_audio_chunks(chunks):
-    global transcription_in_progress
+def _load_whisper_small():
+    global _whisper_small
+    if _whisper_small: return _whisper_small
+    with _whisper_lock:
+        if _whisper_small: return _whisper_small
+        if not WhisperModel: return None
+        emit("status", "Loading Whisper small...")
+        try:
+            _whisper_small = WhisperModel("small", device="cpu", compute_type="int8", cpu_threads=CPU_THREADS)
+            emit("status", "Whisper small loaded")
+        except Exception as e:
+            emit("status", f"Whisper small failed: {e}")
+    return _whisper_small
 
-    send_event("status", current_state, "Transcription started")
+def _load_whisper_base():
+    """Whisper base — used for system audio. 80% accuracy, ~1s/chunk on CPU.
+    Clean digital audio from loopback doesn't need the full 'small' model,
+    but 'base' is significantly more accurate than 'tiny' for multi-language."""
+    global _whisper_tiny
+    if _whisper_tiny: return _whisper_tiny
+    with _whisper_lock:
+        if _whisper_tiny: return _whisper_tiny
+        if not WhisperModel: return None
+        emit("status", "Loading Whisper base...")
+        try:
+            _whisper_tiny = WhisperModel("base", device="cpu", compute_type="int8", cpu_threads=CPU_THREADS)
+            emit("status", "Whisper base loaded")
+        except Exception as e:
+            emit("status", f"Whisper base failed: {e}")
+    return _whisper_tiny
+
+def whisper():
+    return _load_whisper_base() if audio_source == "system" else _load_whisper_small()
+
+def _load_translator(lang):
+    if not MarianMTModel or not MarianTokenizer: return None, None
+    name = TRANSLATION_MODELS.get(lang)
+    if not name: return None, None
+    if name in _tl_cache: return _tl_cache[name]
+    with _tl_lock:
+        if name in _tl_cache: return _tl_cache[name]
+        emit("status", f"Loading translator: {name}")
+        try:
+            tok = MarianTokenizer.from_pretrained(name)
+            mdl = MarianMTModel.from_pretrained(name)
+            _tl_cache[name] = (tok, mdl)
+            emit("status", f"Translator loaded")
+            return tok, mdl
+        except Exception as e:
+            emit("status", f"Translator failed: {e}")
+            return None, None
+
+def preload():
+    emit("status", "Pre-loading models...")
+    _load_whisper_small()
+    _load_whisper_base()
+    emit("status", "Models ready")
+
+def translate(text, src, tgt="en"):
+    if not text.strip() or src == tgt: return text
+    tok, mdl = _load_translator(src)
+    if not tok: return text
+    try:
+        inp = tok([text], return_tensors="pt", padding=True, truncation=True)
+        in_len = inp["input_ids"].shape[1]
+        out = mdl.generate(
+            **inp,
+            num_beams=4,
+            max_length=min(max(in_len * 3, 20), 200),
+            repetition_penalty=2.0,
+            no_repeat_ngram_size=3,
+        )
+        result = tok.decode(out[0], skip_special_tokens=True)
+        # Truncate runaway output
+        if len(result) > len(text) * 4:
+            result = result[:len(text) * 3].rstrip() + "..."
+        return result
+    except Exception:
+        return text
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TRANSCRIPTION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def transcribe(chunks):
+    global vad_in_progress
 
     try:
-        if np is None or not chunks:
+        if not np or not chunks: return
+        mdl = whisper()
+        if not mdl: return
+
+        audio = np.concatenate(chunks, axis=0).astype("float32").flatten()
+        audio = normalize(audio)
+        dur = len(audio) / SAMPLE_RATE
+
+        # Gate: too short for meaningful speech
+        if audio_source == "system" and dur < SYS_MIN_SPEECH_SECONDS:
+            emit("status", f"Too short ({dur:.1f}s) — skipped")
             return
 
-        model = ensure_whisper_model()
-        if model is None:
-            return
+        emit("status", f"Transcribing {dur:.1f}s...")
 
-        send_event("status", current_state, f"Processing {len(chunks)} audio chunks")
-
-        audio_data = np.concatenate(chunks, axis=0).astype("float32").flatten()
-
-        # Normalize audio for consistent Whisper input levels
-        audio_data = normalize_audio(audio_data)
-
-        send_event("status", current_state,
-                    f"Audio: {len(audio_data)} samples ({len(audio_data)/SAMPLE_RATE:.1f}s)")
-
-        # Build transcription kwargs
-        transcribe_kwargs = {
-            "beam_size": 5,
+        kw = {
+            "beam_size": 1 if audio_source == "system" else 5,
             "vad_filter": True,
             "temperature": 0.0,
             "condition_on_previous_text": False,
+            "vad_parameters": {
+                "min_speech_duration_ms": 400,
+                "min_silence_duration_ms": 250,
+                "speech_pad_ms": 150,
+                "threshold": 0.3,
+            },
         }
 
-        # Language hint from recent detections
-        lang_hint = get_language_hint()
-        if lang_hint:
-            transcribe_kwargs["language"] = lang_hint
-            send_event("status", current_state, f"Language hint: {lang_hint}")
+        hint = lang_hint()
+        if hint:
+            kw["language"] = hint
 
-        segments, info = model.transcribe(audio_data, **transcribe_kwargs)
+        segs, info = mdl.transcribe(audio, **kw)
+        parts = [s.text.strip() for s in segs if s.text.strip()]
+        raw = " ".join(parts).strip()
+        lang = getattr(info, "language", "?")
+        prob = getattr(info, "language_probability", 0.0)
 
-        text_parts = []
-        for segment in segments:
-            cleaned = segment.text.strip()
-            if cleaned:
-                text_parts.append(cleaned)
-
-        raw_text = " ".join(text_parts).strip()
-        source_language = getattr(info, "language", "unknown")
-        language_probability = getattr(info, "language_probability", 0.0)
-
-        send_event("status", current_state,
-                    f"Whisper: {len(text_parts)} segments, {source_language} ({language_probability:.2f})")
-
-        # Clean
-        text = clean_transcription(raw_text)
+        text = postprocess(raw)
         if not text:
-            send_event("status", current_state, "Empty/junk transcription — skipped")
+            emit("status", "Filtered by post-processor — skipped")
             return
 
-        # Track language
-        record_language(source_language)
+        record_lang(lang)
 
-        # Confidence gate
-        if language_probability < MIN_LANGUAGE_CONFIDENCE:
-            send_event("status", current_state,
-                        f"Low confidence ({language_probability:.2f}) — skipped. Raw: {text}")
-            send_event("transcription", "detected", text, data={
-                "text": text, "language": source_language,
-                "language_probability": language_probability, "low_confidence": True,
-            })
+        if prob < MIN_LANGUAGE_CONFIDENCE:
+            emit("status", f"Low confidence ({prob:.2f}) — skipped")
+            emit("transcription", text, {"text": text, "language": lang,
+                 "language_probability": prob, "low_confidence": True})
             return
 
-        # Emit transcription
-        send_event("transcription", "detected", text, data={
-            "text": text, "language": source_language,
-            "language_probability": language_probability, "low_confidence": False,
-        })
+        # Record for deduplication before emitting
+        _record_output(text)
 
-        # Translate
-        if source_language and source_language != "en":
-            translated = translate_text(text, source_language, "en")
-            send_event("translation", "detected", translated, data={
-                "translated_text": translated,
-                "source_language": source_language,
-                "target_language": "en",
-            })
+        emit("transcription", text, {"text": text, "language": lang,
+             "language_probability": prob, "low_confidence": False})
+
+        if lang and lang != "en":
+            tl = translate(text, lang)
+            # Post-process the translation too — MarianMT can hallucinate
+            if _detect_repetition(tl):
+                tl = _collapse_repetition(tl)
+                if _detect_repetition(tl):
+                    tl = text  # fall back to original if translation is gibberish
+                    emit("status", "Translation hallucination — showing original")
+            emit("translation", tl, {"translated_text": tl,
+                 "source_language": lang, "target_language": "en"})
         else:
-            send_event("translation", "detected", text, data={
-                "translated_text": text,
-                "source_language": "en",
-                "target_language": "en",
-            })
+            emit("translation", text, {"translated_text": text,
+                 "source_language": "en", "target_language": "en"})
 
     except Exception as e:
-        send_event("status", current_state, f"Transcription error: {e}")
-        send_event("status", current_state, traceback.format_exc())
+        emit("status", f"Transcription error: {e}")
+        emit("status", traceback.format_exc())
     finally:
         with lock:
-            transcription_in_progress = False
-
-        # Auto-resume monitoring after transcription
-        if AUTO_RESUME_MONITORING and not shutdown_event.is_set():
-            time.sleep(0.1)
-            auto_resume_monitoring()
+            vad_in_progress = False
+        if AUTO_RESUME and not shutdown.is_set():
+            time.sleep(0.05)
+            _auto_resume()
 
 
-def auto_resume_monitoring() -> None:
-    """Automatically return to monitoring after transcription completes."""
-    global current_state, is_monitoring
-
+def _auto_resume():
+    global state, monitoring
     with lock:
-        if current_state != "detected":
-            return  # user already changed state
-        is_monitoring = True
-        reset_monitoring_state()
-        current_state = "monitoring"
-
-    send_event("state_change", "monitoring", "Auto-resumed monitoring")
-    start_input_stream_if_needed()
-
-
-# ━━ Audio Stream ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-def stop_input_stream() -> None:
-    global input_stream
-    if input_stream is not None:
-        try:
-            input_stream.stop()
-            input_stream.close()
-        except Exception:
-            pass
-        finally:
-            input_stream = None
+        if state != "detected": return
+        monitoring = True
+        _reset_vad()
+        state = "monitoring"
+    emit("state_change", "Auto-resumed")
+    if audio_source == "mic":
+        _start_mic()
+    elif pa_stream is None:
+        _start_system()
 
 
-def finalize_utterance(level: float, buffered_chunks):
-    send_event("voice_activity", "monitoring", f"Utterance finalized (level={level:.4f})")
-    send_event("state_change", "detected", "Speech detected — transcribing")
+# ═══════════════════════════════════════════════════════════════════════════════
+# VAD PIPELINE
+# ═══════════════════════════════════════════════════════════════════════════════
 
-    # 1. Stop audio stream
-    stop_input_stream()
+def _process_block(block):
+    """Core VAD. Called for every 64ms audio block from either source."""
+    global state, monitoring
+    global vad_voice_frames, vad_buffer, vad_in_progress
+    global vad_speech_on, vad_silence, vad_trigger
 
-    # 2. Let PortAudio drain (prevents CTranslate2 segfault on Windows)
-    time.sleep(STREAM_TEARDOWN_DELAY)
-
-    # 3. Run transcription
-    thread = threading.Thread(target=transcribe_audio_chunks, args=(buffered_chunks,), daemon=True)
-    thread.start()
-
-
-def audio_callback(indata, frames, time_info, status):
-    global current_state, is_monitoring
-    global voice_active_frames, audio_buffer, transcription_in_progress
-    global speech_started, silence_frames, post_trigger_frames
-
-    if status or np is None:
-        return
+    if not np: return
 
     try:
-        buffer_copy = indata.copy()
-        level = float(np.sqrt(np.mean(buffer_copy ** 2)))
+        level = float(np.sqrt(np.mean(block ** 2)))
     except Exception:
         return
 
-    # Track noise floor (always, even outside lock)
-    update_noise_floor(level)
-    threshold = get_voice_threshold()
+    _update_noise(level)
+    thresh = _threshold()
 
-    buffered_chunks = None
-    should_finalize = False
+    chunks = None
+    finalize = False
 
     with lock:
-        if current_state != "monitoring" or not is_monitoring:
+        if state != "monitoring" or not monitoring:
             return
 
-        audio_buffer.append(buffer_copy)
-        if len(audio_buffer) > MAX_BUFFER_BLOCKS:
-            audio_buffer = audio_buffer[-MAX_BUFFER_BLOCKS:]
+        vad_buffer.append(block.copy())
+        if len(vad_buffer) > _max_buf():
+            vad_buffer = vad_buffer[-_max_buf():]
 
-        if level > threshold:
-            voice_active_frames += 1
+        if level > thresh:
+            vad_voice_frames += 1
         else:
-            voice_active_frames = max(0, voice_active_frames - 1)
+            vad_voice_frames = max(0, vad_voice_frames - 1)
 
-        if transcription_in_progress:
+        if vad_in_progress:
             return
 
-        if not speech_started:
-            if len(audio_buffer) > PRE_ROLL_BLOCKS:
-                audio_buffer = audio_buffer[-PRE_ROLL_BLOCKS:]
-
-            if voice_active_frames >= VOICE_FRAMES_REQUIRED:
-                speech_started = True
-                silence_frames = 0
-                post_trigger_frames = 0
-                send_event("voice_activity", "monitoring",
-                           f"Speech started (level={level:.4f}, threshold={threshold:.4f})")
+        if not vad_speech_on:
+            if len(vad_buffer) > _pre_roll():
+                vad_buffer = vad_buffer[-_pre_roll():]
+            if vad_voice_frames >= _frames_req():
+                vad_speech_on = True
+                vad_silence = 0
+                vad_trigger = 0
+                emit("voice_activity", f"Speech (level={level:.4f} thresh={thresh:.4f})")
             return
 
-        post_trigger_frames += 1
-
-        if level > threshold:
-            silence_frames = 0
+        vad_trigger += 1
+        if level > thresh:
+            vad_silence = 0
         else:
-            silence_frames += 1
+            vad_silence += 1
 
-        if silence_frames >= POST_SPEECH_SILENCE_FRAMES or post_trigger_frames >= MAX_POST_TRIGGER_FRAMES:
-            transcription_in_progress = True
-            current_state = "detected"
-            is_monitoring = False
-            buffered_chunks = list(audio_buffer)
-            audio_buffer = []
-            should_finalize = True
+        if vad_silence >= _silence_req() or vad_trigger >= _max_trigger():
+            vad_in_progress = True
+            state = "detected"
+            monitoring = False
+            chunks = list(vad_buffer)
+            vad_buffer = []
+            finalize = True
 
-    if should_finalize and buffered_chunks is not None:
-        threading.Thread(
-            target=finalize_utterance,
-            args=(level, buffered_chunks),
-            daemon=True,
-        ).start()
+    if finalize and chunks:
+        threading.Thread(target=_finalize, args=(level, chunks), daemon=True).start()
 
 
-def start_input_stream_if_needed() -> None:
-    global input_stream, selected_input_device
+def _finalize(level, chunks):
+    emit("voice_activity", f"Finalized (level={level:.4f})")
+    emit("state_change", "Transcribing...")
 
-    if sd is None or np is None:
+    if audio_source != "system":
+        _stop_all()
+        time.sleep(STREAM_TEARDOWN_DELAY)
+
+    transcribe(chunks)
+
+
+def _reset_vad():
+    global vad_voice_frames, vad_buffer, vad_in_progress
+    global vad_speech_on, vad_silence, vad_trigger
+    vad_voice_frames = 0
+    vad_buffer = []
+    vad_in_progress = False
+    vad_speech_on = False
+    vad_silence = 0
+    vad_trigger = 0
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MIC STREAM
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _mic_cb(indata, frames, ti, status):
+    if status or not np: return
+    try: _process_block(indata.copy().flatten())
+    except Exception: pass
+
+def _start_mic():
+    global sd_stream
+    if not sd or not np: return
+    if selected_mic is None: set_mic()
+    if selected_mic is None: return
+    if sd_stream: return
+    try:
+        sd_stream = sd.InputStream(device=selected_mic, channels=CHANNELS,
+                                    samplerate=SAMPLE_RATE, blocksize=BLOCKSIZE,
+                                    dtype="float32", callback=_mic_cb)
+        sd_stream.start()
+        emit("status", "Mic started")
+    except Exception as e:
+        sd_stream = None
+        emit("status", f"Mic failed: {e}")
+
+def _stop_mic():
+    global sd_stream
+    if sd_stream:
+        try: sd_stream.stop(); sd_stream.close()
+        except Exception: pass
+        sd_stream = None
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SYSTEM AUDIO (WASAPI LOOPBACK)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _loopback_loop():
+    """Continuously reads from WASAPI loopback. Stays alive during transcription.
+    
+    CRITICAL: This thread must NOT exit except when state is idle.
+    It retries on read errors instead of breaking.
+    """
+    global pa_stream
+    if not pa_stream or not loopback_info or not np:
+        emit("status", "Loopback reader: missing prerequisites")
         return
 
-    if selected_input_device is None:
-        set_default_input_device()
-    if selected_input_device is None:
+    rate = int(loopback_info.get("defaultSampleRate", 48000))
+    ch = int(loopback_info.get("maxInputChannels", 2))
+    chunk = int(rate * 0.064)
+    errors = 0
+
+    emit("status", f"Loopback: {rate}Hz {ch}ch {chunk}frames/read")
+
+    while not shutdown.is_set():
+        # Only exit on explicit idle — stay alive for monitoring AND detected
+        with lock:
+            if state == "idle" and not monitoring:
+                break
+            stream_ok = pa_stream is not None
+
+        if not stream_ok:
+            emit("status", "Loopback: stream closed, exiting")
+            break
+
+        try:
+            raw = pa_stream.read(chunk, exception_on_overflow=False)
+            a = np.frombuffer(raw, dtype=np.float32)
+            mono = to_mono(a, ch)
+            r = resample(mono, rate, SAMPLE_RATE).astype(np.float32)
+            _process_block(r)
+            errors = 0  # reset error count on success
+        except Exception as e:
+            errors += 1
+            if errors <= 3:
+                # Transient error — wait briefly and retry
+                time.sleep(0.1)
+                continue
+            if not shutdown.is_set():
+                emit("status", f"Loopback failed after {errors} errors: {e}")
+            break
+
+    emit("status", "Loopback reader exited")
+
+
+def _start_system():
+    global pa_inst, pa_stream, loopback_thread, loopback_info
+    if not pyaudio:
+        emit("status", "PyAudioWPatch not installed")
+        return
+    if not np:
+        emit("status", "numpy not installed")
         return
 
-    if input_stream is not None:
+    # If stream already active, don't restart
+    if pa_stream is not None:
+        emit("status", "System stream already active")
+        return
+    # If loopback thread is still alive, don't start another
+    if loopback_thread is not None and loopback_thread.is_alive():
+        emit("status", "Loopback thread still running")
+        return
+
+    # ALWAYS re-detect the loopback device.
+    # This handles headphone plug/unplug: Windows changes the default
+    # output device, so the loopback target changes too.
+    # Without this, unplugging headphones would leave VoxDub capturing
+    # from the old (now inactive) headphone device.
+    set_loopback()
+    if not loopback_info:
+        emit("status", "No loopback device available")
         return
 
     try:
-        input_stream = sd.InputStream(
-            device=selected_input_device,
-            channels=CHANNELS,
-            samplerate=SAMPLE_RATE,
-            blocksize=BLOCKSIZE,
-            dtype="float32",
-            callback=audio_callback,
-        )
-        input_stream.start()
-        send_event("status", current_state, "Audio stream started")
+        rate = int(loopback_info.get("defaultSampleRate", 48000))
+        ch = int(loopback_info.get("maxInputChannels", 2))
+        pa_inst = pyaudio.PyAudio()
+        pa_stream = pa_inst.open(format=pyaudio.paFloat32, channels=ch, rate=rate,
+                                  input=True, input_device_index=loopback_info["index"],
+                                  frames_per_buffer=int(rate * 0.064))
+        emit("status", f"System audio started ({rate}Hz {ch}ch)")
+        loopback_thread = threading.Thread(target=_loopback_loop, daemon=True)
+        loopback_thread.start()
     except Exception as e:
-        input_stream = None
-        send_event("status", current_state, f"Audio stream failed: {e}")
+        pa_stream = None
+        if pa_inst:
+            try: pa_inst.terminate()
+            except Exception: pass
+            pa_inst = None
+        emit("status", f"System audio failed: {e}")
 
 
-def reset_monitoring_state():
-    global voice_active_frames, audio_buffer, transcription_in_progress
-    global speech_started, silence_frames, post_trigger_frames
+def _stop_system():
+    global pa_stream, pa_inst, loopback_thread
+    if pa_stream:
+        try: pa_stream.stop_stream(); pa_stream.close()
+        except Exception: pass
+        pa_stream = None
+    if pa_inst:
+        try: pa_inst.terminate()
+        except Exception: pass
+        pa_inst = None
+    loopback_thread = None
 
-    voice_active_frames = 0
-    audio_buffer = []
-    transcription_in_progress = False
-    speech_started = False
-    silence_frames = 0
-    post_trigger_frames = 0
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# STREAM CONTROL
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _start_source():
+    if audio_source == "mic": _start_mic()
+    else: _start_system()
+
+def _stop_all():
+    _stop_mic()
+    _stop_system()
 
 
-# ━━ Command Handler ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ═══════════════════════════════════════════════════════════════════════════════
+# COMMANDS
+# ═══════════════════════════════════════════════════════════════════════════════
 
-def handle_command(command: dict) -> None:
-    global current_state, is_monitoring
+def handle(cmd):
+    global state, monitoring, audio_source, AUTO_RESUME, noise_floor, noise_n
 
-    action = command.get("action")
+    action = cmd.get("action")
 
     if action == "start_monitoring":
         with lock:
-            if current_state == "monitoring":
-                send_event("status", current_state, "Already monitoring")
+            if state == "monitoring":
+                emit("status", "Already monitoring")
                 return
-            is_monitoring = True
-            reset_monitoring_state()
-            current_state = "monitoring"
-        start_input_stream_if_needed()
-        send_event("state_change", "monitoring", "Monitoring started")
+            monitoring = True
+            _reset_vad()
+            state = "monitoring"
+        _start_source()
+        emit("state_change", f"Monitoring ({audio_source})")
 
     elif action == "start_dubbing":
         with lock:
-            if current_state != "detected":
-                send_event("status", current_state, "Cannot dub: not in detected state")
-                return
-            current_state = "dubbing"
-        send_event("state_change", "dubbing", "Dubbing started")
+            if state != "detected": return
+            state = "dubbing"
+        emit("state_change", "Dubbing started")
 
     elif action == "stop":
         with lock:
-            is_monitoring = False
-            reset_monitoring_state()
-            current_state = "idle"
-        stop_input_stream()
-        send_event("state_change", "idle", "Stopped")
+            monitoring = False
+            _reset_vad()
+            state = "idle"
+        _stop_all()
+        emit("state_change", "Stopped")
 
     elif action == "simulate_detection":
         with lock:
-            if current_state != "monitoring":
-                send_event("status", current_state, "Not monitoring")
-                return
-            is_monitoring = False
-            current_state = "detected"
-        stop_input_stream()
-        send_event("state_change", "detected", "Manual detection triggered")
+            if state != "monitoring": return
+            monitoring = False
+            state = "detected"
+        _stop_all()
+        emit("state_change", "Manual detection")
 
-    elif action == "list_audio_devices":
-        list_audio_devices()
+    elif action == "set_audio_source":
+        src = cmd.get("source", "mic")
+        if src not in ("mic", "system"): return
 
-    elif action == "set_default_input_device":
-        set_default_input_device()
+        was_mon = False
+        with lock:
+            if state == "monitoring":
+                was_mon = True
+                monitoring = False
+                _reset_vad()
+        if was_mon: _stop_all()
 
+        audio_source = src
+        noise_floor = 0.005
+        noise_n = 0
+        emit("status", f"Source: {audio_source}")
+
+        if src == "mic": set_mic()
+        else: set_loopback()
+
+        if was_mon:
+            with lock:
+                monitoring = True
+                _reset_vad()
+                state = "monitoring"
+            _start_source()
+            emit("state_change", f"Monitoring ({audio_source})")
+
+    elif action == "list_audio_devices": list_devices()
+    elif action == "set_default_input_device": set_mic()
+    elif action == "set_default_loopback_device": set_loopback()
     elif action == "set_auto_resume":
-        global AUTO_RESUME_MONITORING
-        AUTO_RESUME_MONITORING = command.get("enabled", True)
-        send_event("status", current_state, f"Auto-resume: {AUTO_RESUME_MONITORING}")
-
+        AUTO_RESUME = cmd.get("enabled", True)
+        emit("status", f"Auto-resume: {AUTO_RESUME}")
     else:
-        send_event("status", current_state, f"Unknown command: {action}")
+        emit("status", f"Unknown command: {action}")
 
 
-# ━━ Main ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ═══════════════════════════════════════════════════════════════════════════════
+# MAIN
+# ═══════════════════════════════════════════════════════════════════════════════
 
-def main() -> None:
-    preload_models()
-    send_event("status", "idle", "Worker ready")
-
+def main():
+    preload()
+    emit("status", "Worker ready")
     try:
-        while not shutdown_event.is_set():
+        while not shutdown.is_set():
             line = sys.stdin.readline()
-            if not line:
-                break
-            try:
-                command = json.loads(line.strip())
-                handle_command(command)
-            except json.JSONDecodeError:
-                pass
-            except Exception as e:
-                send_event("status", current_state, f"Command error: {e}")
+            if not line: break
+            try: handle(json.loads(line.strip()))
+            except json.JSONDecodeError: pass
+            except Exception as e: emit("status", f"Error: {e}")
     finally:
-        shutdown_event.set()
-        stop_input_stream()
-
+        shutdown.set()
+        _stop_all()
 
 if __name__ == "__main__":
-    try:
-        main()
+    try: main()
     except KeyboardInterrupt:
-        shutdown_event.set()
-        stop_input_stream()
+        shutdown.set()
+        _stop_all()
         sys.exit(0)

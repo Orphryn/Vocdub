@@ -67,7 +67,6 @@ export function startPythonWorker(onEvent: (event: WorkerEvent) => void): void {
   workerProcess.stderr.on("data", (data: string) => {
     const msg = data.trim();
     if (!msg) return;
-    // Suppress noisy warnings
     if (msg.includes("UserWarning:")) return;
     if (msg.includes("Loading weights:")) return;
     if (msg.includes("tie_word_embeddings")) return;
@@ -104,7 +103,6 @@ export function sendCommand(command: object): void {
 export function stopPythonWorker(): void {
   intentionallyStopped = true;
   if (workerProcess) {
-    // Send stop command first for graceful shutdown
     try {
       workerProcess.stdin.write(JSON.stringify({ action: "stop" }) + "\n");
     } catch { /* ignore */ }
